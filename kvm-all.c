@@ -618,14 +618,14 @@ static void kvm_set_phys_mem(MemoryRegionSection *section, bool add)
 
     /* kvm works in page size chunks, but the function may be called
        with sub-page size and unaligned start address. */
-    delta = TARGET_PAGE_ALIGN(size) - size;
+    delta = HOST_PAGE_ALIGN(start_addr) - start_addr;
     if (delta > size) {
         return;
     }
     start_addr += delta;
     size -= delta;
-    size &= TARGET_PAGE_MASK;
-    if (!size || (start_addr & ~TARGET_PAGE_MASK)) {
+    size &= qemu_host_page_mask;
+    if (!size || (start_addr & ~qemu_host_page_mask)) {
         return;
     }
 
@@ -1444,6 +1444,9 @@ int kvm_init(MachineClass *mc)
     soft_vcpus_limit = kvm_recommended_vcpus(s);
     hard_vcpus_limit = kvm_max_vcpus(s);
 
+    /* RHEL doesn't support nr_vcpus > soft_vcpus_limit */
+    hard_vcpus_limit = soft_vcpus_limit;
+
     while (nc->name) {
         if (nc->num > soft_vcpus_limit) {
             fprintf(stderr,
@@ -1678,6 +1681,11 @@ void kvm_cpu_synchronize_post_reset(CPUState *cpu)
 void kvm_cpu_synchronize_post_init(CPUState *cpu)
 {
     kvm_arch_put_registers(cpu, KVM_PUT_FULL_STATE);
+    cpu->kvm_vcpu_dirty = false;
+}
+
+void kvm_cpu_clean_state(CPUState *cpu)
+{
     cpu->kvm_vcpu_dirty = false;
 }
 

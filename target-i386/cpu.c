@@ -454,6 +454,7 @@ static uint32_t kvm_default_features[FEATURE_WORDS] = {
         (1 << KVM_FEATURE_ASYNC_PF) |
         (1 << KVM_FEATURE_STEAL_TIME) |
         (1 << KVM_FEATURE_PV_EOI) |
+        (1 << KVM_FEATURE_PV_UNHALT) |
         (1 << KVM_FEATURE_CLOCKSOURCE_STABLE_BIT),
     [FEAT_1_ECX] = CPUID_EXT_X2APIC,
 };
@@ -592,7 +593,8 @@ static bool lookup_feature(uint32_t *pval, const char *s, const char *e,
 }
 
 static void add_flagname_to_bitmaps(const char *flagname,
-                                    FeatureWordArray words)
+                                    FeatureWordArray words,
+                                    Error **errp)
 {
     FeatureWord w;
     for (w = 0; w < FEATURE_WORDS; w++) {
@@ -603,7 +605,7 @@ static void add_flagname_to_bitmaps(const char *flagname,
         }
     }
     if (w == FEATURE_WORDS) {
-        fprintf(stderr, "CPU feature %s not found\n", flagname);
+        error_setg(errp, "CPU feature %s not found", flagname);
     }
 }
 
@@ -652,24 +654,31 @@ struct X86CPUDefinition {
 
 static X86CPUDefinition builtin_x86_defs[] = {
     {
+        /* qemu64 is the default CPU model for all *-rhel7.* machine-types.
+         * The default on RHEL-6 was cpu64-rhel6.
+         * libvirt assumes that qemu64 is the default for _all_ machine-types,
+         * so we should try to keep qemu64 and cpu64-rhel6 as similar as
+         * possible.
+         */
         .name = "qemu64",
         .level = 4,
         .vendor = CPUID_VENDOR_AMD,
         .family = 6,
-        .model = 6,
+        .model = 13,
         .stepping = 3,
-        .features[FEAT_1_EDX] =
-            PPRO_FEATURES |
-            CPUID_MTRR | CPUID_CLFLUSH | CPUID_MCA |
-            CPUID_PSE36,
-        .features[FEAT_1_ECX] =
-            CPUID_EXT_SSE3 | CPUID_EXT_CX16 | CPUID_EXT_POPCNT,
-        .features[FEAT_8000_0001_EDX] =
-            (PPRO_FEATURES & CPUID_EXT2_AMD_ALIASES) |
-            CPUID_EXT2_LM | CPUID_EXT2_SYSCALL | CPUID_EXT2_NX,
-        .features[FEAT_8000_0001_ECX] =
-            CPUID_EXT3_LAHF_LM | CPUID_EXT3_SVM |
-            CPUID_EXT3_ABM | CPUID_EXT3_SSE4A,
+        .features[FEAT_1_EDX] = CPUID_SSE2 | CPUID_SSE | CPUID_FXSR |
+             CPUID_MMX | CPUID_CLFLUSH | CPUID_PSE36 | CPUID_PAT | CPUID_CMOV |
+             CPUID_MCA | CPUID_PGE | CPUID_MTRR | CPUID_SEP | CPUID_APIC |
+             CPUID_CX8 | CPUID_MCE | CPUID_PAE | CPUID_MSR | CPUID_TSC |
+             CPUID_PSE | CPUID_DE | CPUID_FP87,
+        .features[FEAT_1_ECX] = CPUID_EXT_CX16 | CPUID_EXT_SSE3,
+        .features[FEAT_8000_0001_EDX] = CPUID_EXT2_LM | CPUID_EXT2_FXSR |
+             CPUID_EXT2_MMX | CPUID_EXT2_NX | CPUID_EXT2_PAT | CPUID_EXT2_CMOV |
+             CPUID_EXT2_PGE | CPUID_EXT2_SYSCALL | CPUID_EXT2_APIC |
+             CPUID_EXT2_CX8 | CPUID_EXT2_MCE | CPUID_EXT2_PAE | CPUID_EXT2_MSR | CPUID_EXT2_TSC |
+             CPUID_EXT2_PSE | CPUID_EXT2_DE | CPUID_EXT2_FPU,
+        .features[FEAT_8000_0001_ECX] = CPUID_EXT3_SSE4A | CPUID_EXT3_ABM |
+             CPUID_EXT3_SVM | CPUID_EXT3_LAHF_LM,
         .xlevel = 0x8000000A,
     },
     {
@@ -888,6 +897,29 @@ static X86CPUDefinition builtin_x86_defs[] = {
             CPUID_EXT3_LAHF_LM,
         .xlevel = 0x8000000A,
         .model_id = "Intel(R) Atom(TM) CPU N270   @ 1.60GHz",
+    },
+    {
+        .name = "cpu64-rhel6",
+        .level = 4,
+        .vendor = CPUID_VENDOR_AMD,
+        .family = 6,
+        .model = 13,
+        .stepping = 3,
+        .features[FEAT_1_EDX] = CPUID_SSE2 | CPUID_SSE | CPUID_FXSR |
+             CPUID_MMX | CPUID_CLFLUSH | CPUID_PSE36 | CPUID_PAT | CPUID_CMOV |
+             CPUID_MCA | CPUID_PGE | CPUID_MTRR | CPUID_SEP | CPUID_APIC |
+             CPUID_CX8 | CPUID_MCE | CPUID_PAE | CPUID_MSR | CPUID_TSC |
+             CPUID_PSE | CPUID_DE | CPUID_FP87,
+        .features[FEAT_1_ECX] = CPUID_EXT_CX16 | CPUID_EXT_SSE3,
+        .features[FEAT_8000_0001_EDX] = CPUID_EXT2_LM | CPUID_EXT2_FXSR |
+             CPUID_EXT2_MMX | CPUID_EXT2_NX | CPUID_EXT2_PAT | CPUID_EXT2_CMOV |
+             CPUID_EXT2_PGE | CPUID_EXT2_SYSCALL | CPUID_EXT2_APIC |
+             CPUID_EXT2_CX8 | CPUID_EXT2_MCE | CPUID_EXT2_PAE | CPUID_EXT2_MSR | CPUID_EXT2_TSC |
+             CPUID_EXT2_PSE | CPUID_EXT2_DE | CPUID_EXT2_FPU,
+        .features[FEAT_8000_0001_ECX] = CPUID_EXT3_SSE4A | CPUID_EXT3_ABM |
+             CPUID_EXT3_SVM | CPUID_EXT3_LAHF_LM,
+        .xlevel = 0x8000000A,
+        .model_id = "QEMU Virtual CPU version (cpu64-rhel6)",
     },
     {
         .name = "Conroe",
@@ -1761,9 +1793,9 @@ static void x86_cpu_parse_featurestr(CPUState *cs, char *features,
     while (featurestr) {
         char *val;
         if (featurestr[0] == '+') {
-            add_flagname_to_bitmaps(featurestr + 1, plus_features);
+            add_flagname_to_bitmaps(featurestr + 1, plus_features, &local_err);
         } else if (featurestr[0] == '-') {
-            add_flagname_to_bitmaps(featurestr + 1, minus_features);
+            add_flagname_to_bitmaps(featurestr + 1, minus_features, &local_err);
         } else if ((val = strchr(featurestr, '='))) {
             *val = 0; val++;
             feat2prop(featurestr);
@@ -2456,8 +2488,13 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
 /* XXX: This value must match the one used in the MMU code. */
         if (env->features[FEAT_8000_0001_EDX] & CPUID_EXT2_LM) {
             /* 64 bit processor */
-/* XXX: The physical address space is limited to 42 bits in exec.c. */
             *eax = 0x00003028; /* 48 bits virtual, 40 bits physical */
+            if (kvm_enabled()) {
+                uint32_t _eax;
+                host_cpuid(0x80000000, 0, &_eax, NULL, NULL, NULL);
+                if (_eax >= 0x80000008)
+                    host_cpuid(0x80000008, 0, eax, NULL, NULL, NULL);
+            }
         } else {
             if (env->features[FEAT_1_EDX] & CPUID_PSE36) {
                 *eax = 0x00000024; /* 36 bits physical */

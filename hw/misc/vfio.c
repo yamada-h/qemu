@@ -262,6 +262,7 @@ static const VFIORomBlacklistEntry romblacklist[] = {
 };
 
 #define MSIX_CAP_LENGTH 12
+#define MAX_DEV_ASSIGN_CMDLINE 32
 
 static QLIST_HEAD(, VFIOGroup)
     group_list = QLIST_HEAD_INITIALIZER(group_list);
@@ -2715,16 +2716,19 @@ static void vfio_listener_release(VFIOContainer *container)
  */
 static void vfio_disable_interrupts(VFIODevice *vdev)
 {
-    switch (vdev->interrupt) {
-    case VFIO_INT_INTx:
-        vfio_disable_intx(vdev);
-        break;
-    case VFIO_INT_MSI:
-        vfio_disable_msi(vdev);
-        break;
-    case VFIO_INT_MSIX:
+    /*
+     * More complicated than it looks.  Disabling MSI/X transitions the
+     * device to INTx mode (if supported).  Therefore we need to first
+     * disable MSI/X and then cleanup by disabling INTx.
+     */
+    if (vdev->interrupt == VFIO_INT_MSIX) {
         vfio_disable_msix(vdev);
-        break;
+    } else if (vdev->interrupt == VFIO_INT_MSI) {
+        vfio_disable_msi(vdev);
+    }
+
+    if (vdev->interrupt == VFIO_INT_INTx) {
+        vfio_disable_intx(vdev);
     }
 }
 
@@ -4173,7 +4177,19 @@ static int vfio_initfn(PCIDevice *pdev)
     ssize_t len;
     struct stat st;
     int groupid;
-    int ret;
+    int ret, i = 0;
+
+    QLIST_FOREACH(group, &group_list, next) {
+        QLIST_FOREACH(pvdev, &group->device_list, next) {
+            i++;
+        }
+    }
+
+    if (i >= MAX_DEV_ASSIGN_CMDLINE) {
+        error_report("vfio: Maximum supported vfio devices (%d) "
+                     "already attached\n", MAX_DEV_ASSIGN_CMDLINE);
+        return -1;
+    }
 
     /* Check that the host device exists */
     snprintf(path, sizeof(path),

@@ -20,6 +20,7 @@ typedef void QEMUMachineHotAddCPUFunc(const int64_t id, Error **errp);
 typedef int QEMUMachineGetKvmtypeFunc(const char *arg);
 
 struct QEMUMachine {
+    const char *family; /* NULL iff @name identifies a standalone machtype */
     const char *name;
     const char *alias;
     const char *desc;
@@ -28,6 +29,7 @@ struct QEMUMachine {
     QEMUMachineHotAddCPUFunc *hot_add_cpu;
     QEMUMachineGetKvmtypeFunc *kvm_type;
     BlockInterfaceType block_default_type;
+    int units_per_default_bus;
     int max_cpus;
     unsigned int no_serial:1,
         no_parallel:1,
@@ -76,6 +78,7 @@ struct MachineClass {
     ObjectClass parent_class;
     /*< public >*/
 
+    const char *family; /* NULL iff @name identifies a standalone machtype */
     const char *name;
     const char *alias;
     const char *desc;
@@ -86,6 +89,7 @@ struct MachineClass {
     int (*kvm_type)(const char *arg);
 
     BlockInterfaceType block_default_type;
+    int units_per_default_bus;
     int max_cpus;
     unsigned int no_serial:1,
         no_parallel:1,

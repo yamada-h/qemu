@@ -59,7 +59,7 @@ static const char *const if_name[IF_COUNT] = {
     [IF_XEN] = "xen",
 };
 
-static const int if_max_devs[IF_COUNT] = {
+static int if_max_devs[IF_COUNT] = {
     /*
      * Do not change these numbers!  They govern how drive option
      * index maps to unit and bus.  That mapping is ABI.
@@ -77,6 +77,30 @@ static const int if_max_devs[IF_COUNT] = {
     [IF_IDE] = 2,
     [IF_SCSI] = 7,
 };
+
+/**
+ * Boards may call this to offer board-by-board overrides
+ * of the default, global values.
+ */
+void override_max_devs(BlockInterfaceType type, int max_devs)
+{
+    DriveInfo *dinfo;
+
+    if (max_devs <= 0) {
+        return;
+    }
+
+    QTAILQ_FOREACH(dinfo, &drives, next) {
+        if (dinfo->type == type) {
+            fprintf(stderr, "Cannot override units-per-bus property of"
+                    " the %s interface, because a drive of that type has"
+                    " already been added.\n", if_name[type]);
+            g_assert_not_reached();
+        }
+    }
+
+    if_max_devs[type] = max_devs;
+}
 
 /*
  * We automatically delete the drive when a device using it gets
@@ -108,6 +132,23 @@ void blockdev_auto_del(BlockDriverState *bs)
     if (dinfo && dinfo->auto_del) {
         drive_del(dinfo);
     }
+}
+
+/**
+ * Returns the current mapping of how many units per bus
+ * a particular interface can support.
+ *
+ *  A positive integer indicates n units per bus.
+ *  0 implies the mapping has not been established.
+ * -1 indicates an invalid BlockInterfaceType was given.
+ */
+int drive_get_max_devs(BlockInterfaceType type)
+{
+    if (type >= IF_IDE && type < IF_COUNT) {
+        return if_max_devs[type];
+    }
+
+    return -1;
 }
 
 static int drive_index_to_bus_id(BlockInterfaceType type, int index)
@@ -163,6 +204,27 @@ DriveInfo *drive_get(BlockInterfaceType type, int bus, int unit)
     }
 
     return NULL;
+}
+
+bool drive_check_orphaned(void)
+{
+    DriveInfo *dinfo;
+    bool rs = false;
+
+    QTAILQ_FOREACH(dinfo, &drives, next) {
+        /* If dinfo->bdrv->dev is NULL, it has no device attached. */
+        /* Unless this is a default drive, this may be an oversight. */
+        if (!dinfo->bdrv->dev && !dinfo->is_default &&
+            dinfo->type != IF_NONE) {
+            fprintf(stderr, "Warning: Orphaned drive without device: "
+                    "id=%s,file=%s,if=%s,bus=%d,unit=%d\n",
+                    dinfo->id, dinfo->bdrv->filename, if_name[dinfo->type],
+                    dinfo->bus, dinfo->unit);
+            rs = true;
+        }
+    }
+
+    return rs;
 }
 
 DriveInfo *drive_get_by_index(BlockInterfaceType type, int index)
@@ -231,6 +293,8 @@ typedef struct {
     BlockDriverState *bs;
 } BDRVPutRefBH;
 
+/* right now, this is only used from block_job_cb() */
+#ifdef CONFIG_LIVE_BLOCK_OPS
 static void bdrv_put_ref_bh(void *opaque)
 {
     BDRVPutRefBH *s = opaque;
@@ -256,6 +320,7 @@ static void bdrv_put_ref_bh_schedule(BlockDriverState *bs)
     s->bs = bs;
     qemu_bh_schedule(s->bh);
 }
+#endif
 
 static int parse_block_error_action(const char *buf, bool is_read, Error **errp)
 {
@@ -994,6 +1059,7 @@ void do_commit(Monitor *mon, const QDict *qdict)
     }
 }
 
+#ifdef CONFIG_LIVE_BLOCK_OPS
 static void blockdev_do_action(int kind, void *data, Error **errp)
 {
     TransactionAction action;
@@ -1545,6 +1611,7 @@ exit:
         g_free(state);
     }
 }
+#endif
 
 
 static void eject_device(BlockDriverState *bs, int force, Error **errp)
@@ -1757,6 +1824,7 @@ int do_drive_del(Monitor *mon, const QDict *qdict, QObject **ret_data)
 {
     const char *id = qdict_get_str(qdict, "id");
     BlockDriverState *bs;
+    AioContext *aio_context;
     Error *local_err = NULL;
 
     bs = bdrv_find(id);
@@ -1764,9 +1832,14 @@ int do_drive_del(Monitor *mon, const QDict *qdict, QObject **ret_data)
         error_report("Device '%s' not found", id);
         return -1;
     }
+
+    aio_context = bdrv_get_aio_context(bs);
+    aio_context_acquire(aio_context);
+
     if (bdrv_op_is_blocked(bs, BLOCK_OP_TYPE_DRIVE_DEL, &local_err)) {
         error_report("%s", error_get_pretty(local_err));
         error_free(local_err);
+        aio_context_release(aio_context);
         return -1;
     }
 
@@ -1790,6 +1863,7 @@ int do_drive_del(Monitor *mon, const QDict *qdict, QObject **ret_data)
         drive_del(drive_get_by_blockdev(bs));
     }
 
+    aio_context_release(aio_context);
     return 0;
 }
 
@@ -1799,6 +1873,7 @@ void qmp_block_resize(bool has_device, const char *device,
 {
     Error *local_err = NULL;
     BlockDriverState *bs;
+    AioContext *aio_context;
     int ret;
 
     bs = bdrv_lookup_bs(has_device ? device : NULL,
@@ -1809,19 +1884,22 @@ void qmp_block_resize(bool has_device, const char *device,
         return;
     }
 
+    aio_context = bdrv_get_aio_context(bs);
+    aio_context_acquire(aio_context);
+
     if (!bdrv_is_first_non_filter(bs)) {
         error_set(errp, QERR_FEATURE_DISABLED, "resize");
-        return;
+        goto out;
     }
 
     if (size < 0) {
         error_set(errp, QERR_INVALID_PARAMETER_VALUE, "size", "a >0 size");
-        return;
+        goto out;
     }
 
     if (bdrv_op_is_blocked(bs, BLOCK_OP_TYPE_RESIZE, NULL)) {
         error_set(errp, QERR_DEVICE_IN_USE, device);
-        return;
+        goto out;
     }
 
     /* complete all in-flight operations before resizing the device */
@@ -1847,8 +1925,12 @@ void qmp_block_resize(bool has_device, const char *device,
         error_setg_errno(errp, -ret, "Could not resize");
         break;
     }
+
+out:
+    aio_context_release(aio_context);
 }
 
+#ifdef CONFIG_LIVE_BLOCK_OPS
 static void block_job_cb(void *opaque, int ret)
 {
     BlockDriverState *bs = opaque;
@@ -2302,6 +2384,7 @@ void qmp_drive_mirror(const char *device, const char *target,
         return;
     }
 }
+#endif
 
 static BlockJob *find_block_job(const char *device)
 {
@@ -2665,4 +2748,18 @@ QemuOptsList qemu_drive_opts = {
          */
         { /* end of list */ }
     },
+};
+
+QemuOptsList qemu_simple_drive_opts = {
+    .name = "simple-drive",
+    .implied_opt_name = "format",
+    .head = QTAILQ_HEAD_INITIALIZER(qemu_simple_drive_opts.head),
+    .desc = {
+        /*
+         * no elements => accept any
+         * sanity checking will happen later
+         * when setting device properties
+         */
+        { /* end if list */ }
+    }
 };

@@ -418,6 +418,8 @@ typedef struct XHCIEvent {
     uint32_t flags;
     uint8_t slotid;
     uint8_t epid;
+    uint8_t cve_2014_5263_a;
+    uint8_t cve_2014_5263_b;
 } XHCIEvent;
 
 typedef struct XHCIInterrupter {
@@ -499,6 +501,7 @@ enum xhci_flags {
     XHCI_FLAG_USE_MSI = 1,
     XHCI_FLAG_USE_MSI_X,
     XHCI_FLAG_SS_FIRST,
+    XHCI_FLAG_FORCE_PCIE_ENDCAP,
 };
 
 static void xhci_kick_ep(XHCIState *xhci, unsigned int slotid,
@@ -2265,6 +2268,9 @@ static USBPort *xhci_lookup_uport(XHCIState *xhci, uint32_t *slot_ctx)
     int i, pos, port;
 
     port = (slot_ctx[1]>>16) & 0xFF;
+    if (port < 1 || port > xhci->numports) {
+        return NULL;
+    }
     port = xhci->ports[port-1].uport->index+1;
     pos = snprintf(path, sizeof(path), "%d", port);
     for (i = 0; i < 5; i++) {
@@ -3626,7 +3632,8 @@ static int usb_xhci_initfn(struct PCIDevice *dev)
                      PCI_BASE_ADDRESS_SPACE_MEMORY|PCI_BASE_ADDRESS_MEM_TYPE_64,
                      &xhci->mem);
 
-    if (pci_bus_is_express(dev->bus)) {
+    if (pci_bus_is_express(dev->bus) ||
+        xhci_get_flag(xhci, XHCI_FLAG_FORCE_PCIE_ENDCAP)) {
         ret = pcie_endpoint_cap_init(dev, 0xa0);
         assert(ret >= 0);
     }
@@ -3666,6 +3673,12 @@ static int usb_xhci_post_load(void *opaque, int version_id)
             xhci_mask64(ldq_le_pci_dma(pci_dev, dcbaap + 8 * slotid));
         xhci_dma_read_u32s(xhci, slot->ctx, slot_ctx, sizeof(slot_ctx));
         slot->uport = xhci_lookup_uport(xhci, slot_ctx);
+        if (!slot->uport) {
+            /* should not happen, but may trigger on guest bugs */
+            slot->enabled = 0;
+            slot->addressed = 0;
+            continue;
+        }
         assert(slot->uport && slot->uport->dev);
 
         for (epid = 1; epid <= 31; epid++) {
@@ -3726,9 +3739,25 @@ static const VMStateDescription vmstate_xhci_slot = {
     }
 };
 
+static void xhci_event_pre_save(void *opaque)
+{
+    XHCIEvent *s = opaque;
+
+    s->cve_2014_5263_a = ((uint8_t *)&s->type)[0];
+    s->cve_2014_5263_b = ((uint8_t *)&s->type)[1];
+}
+
+bool migrate_cve_2014_5263_xhci_fields;
+
+static bool xhci_event_cve_2014_5263(void *opaque, int version_id)
+{
+    return migrate_cve_2014_5263_xhci_fields;
+}
+
 static const VMStateDescription vmstate_xhci_event = {
     .name = "xhci-event",
     .version_id = 1,
+    .pre_save = xhci_event_pre_save,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(type,   XHCIEvent),
         VMSTATE_UINT32(ccode,  XHCIEvent),
@@ -3737,6 +3766,8 @@ static const VMStateDescription vmstate_xhci_event = {
         VMSTATE_UINT32(flags,  XHCIEvent),
         VMSTATE_UINT8(slotid,  XHCIEvent),
         VMSTATE_UINT8(epid,    XHCIEvent),
+        VMSTATE_UINT8_TEST(cve_2014_5263_a, XHCIEvent, xhci_event_cve_2014_5263),
+        VMSTATE_UINT8_TEST(cve_2014_5263_b, XHCIEvent, xhci_event_cve_2014_5263),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -3818,6 +3849,8 @@ static Property xhci_properties[] = {
     DEFINE_PROP_BIT("msix",     XHCIState, flags, XHCI_FLAG_USE_MSI_X, true),
     DEFINE_PROP_BIT("superspeed-ports-first",
                     XHCIState, flags, XHCI_FLAG_SS_FIRST, true),
+    DEFINE_PROP_BIT("force-pcie-endcap", XHCIState, flags,
+                    XHCI_FLAG_FORCE_PCIE_ENDCAP, false),
     DEFINE_PROP_UINT32("intrs", XHCIState, numintrs, MAXINTRS),
     DEFINE_PROP_UINT32("slots", XHCIState, numslots, MAXSLOTS),
     DEFINE_PROP_UINT32("p2",    XHCIState, numports_2, 4),

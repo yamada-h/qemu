@@ -701,6 +701,7 @@ static int find_image_format(BlockDriverState *bs, const char *filename,
 
 /**
  * Set the current 'total_sectors' value
+ * Return 0 on success, -errno on error.
  */
 static int refresh_total_sectors(BlockDriverState *bs, int64_t hint)
 {
@@ -2221,7 +2222,6 @@ int bdrv_commit(BlockDriverState *bs)
     int n, ro, open_flags;
     int ret = 0;
     uint8_t *buf = NULL;
-    char filename[PATH_MAX];
 
     if (!drv)
         return -ENOMEDIUM;
@@ -2236,8 +2236,6 @@ int bdrv_commit(BlockDriverState *bs)
     }
 
     ro = bs->backing_hd->read_only;
-    /* Use pstrcpy (not strncpy): filename must be NUL-terminated. */
-    pstrcpy(filename, sizeof(filename), bs->backing_hd->filename);
     open_flags =  bs->backing_hd->open_flags;
 
     if (ro) {
@@ -2842,8 +2840,8 @@ int bdrv_make_zero(BlockDriverState *bs, BdrvRequestFlags flags)
         if (nb_sectors <= 0) {
             return 0;
         }
-        if (nb_sectors > INT_MAX) {
-            nb_sectors = INT_MAX;
+        if (nb_sectors > INT_MAX / BDRV_SECTOR_SIZE) {
+            nb_sectors = INT_MAX / BDRV_SECTOR_SIZE;
         }
         ret = bdrv_get_block_status(bs, sector_num, nb_sectors, &n);
         if (ret < 0) {
@@ -3536,11 +3534,12 @@ int64_t bdrv_get_allocated_file_size(BlockDriverState *bs)
 }
 
 /**
- * Length of a file in bytes. Return < 0 if error or unknown.
+ * Return number of sectors on success, -errno on error.
  */
-int64_t bdrv_getlength(BlockDriverState *bs)
+int64_t bdrv_nb_sectors(BlockDriverState *bs)
 {
     BlockDriver *drv = bs->drv;
+
     if (!drv)
         return -ENOMEDIUM;
 
@@ -3550,19 +3549,26 @@ int64_t bdrv_getlength(BlockDriverState *bs)
             return ret;
         }
     }
-    return bs->total_sectors * BDRV_SECTOR_SIZE;
+    return bs->total_sectors;
+}
+
+/**
+ * Return length in bytes on success, -errno on error.
+ * The length is always a multiple of BDRV_SECTOR_SIZE.
+ */
+int64_t bdrv_getlength(BlockDriverState *bs)
+{
+    int64_t ret = bdrv_nb_sectors(bs);
+
+    return ret < 0 ? ret : ret * BDRV_SECTOR_SIZE;
 }
 
 /* return 0 as number of sectors if no device present or error */
 void bdrv_get_geometry(BlockDriverState *bs, uint64_t *nb_sectors_ptr)
 {
-    int64_t length;
-    length = bdrv_getlength(bs);
-    if (length < 0)
-        length = 0;
-    else
-        length = length >> BDRV_SECTOR_BITS;
-    *nb_sectors_ptr = length;
+    int64_t nb_sectors = bdrv_nb_sectors(bs);
+
+    *nb_sectors_ptr = nb_sectors < 0 ? 0 : nb_sectors;
 }
 
 void bdrv_set_on_error(BlockDriverState *bs, BlockdevOnError on_read_error,
@@ -3596,6 +3602,43 @@ BlockErrorAction bdrv_get_error_action(BlockDriverState *bs, bool is_read, int e
     }
 }
 
+/* https://bugzilla.redhat.com/show_bug.cgi?id=1116772 */
+static RHEL7BlockErrorReason get_rhel7_error_reason(int error)
+{
+	switch (error) {
+	case ENOSPC:
+        return RHEL7_BLOCK_ERROR_REASON_ENOSPC;
+	case EPERM:
+        return RHEL7_BLOCK_ERROR_REASON_EPERM;
+	case EIO:
+        return RHEL7_BLOCK_ERROR_REASON_EIO;
+	default:
+        return RHEL7_BLOCK_ERROR_REASON_EOTHER;
+    }
+}
+
+static void get_rhel7_error_debug_info(RHEL7BlockErrorDebugInfo *info,
+                                       int error)
+{
+    info->q_errno = error;
+    info->message = strerror(error);
+}
+
+static void send_qmp_error_event(BlockDriverState *bs,
+                                 BlockErrorAction action,
+                                 bool is_read, int error,
+                                 RHEL7BlockErrorReason res,
+                                 RHEL7BlockErrorDebugInfo *info)
+{
+    BlockErrorAction ac;
+
+    ac = is_read ? IO_OPERATION_TYPE_READ : IO_OPERATION_TYPE_WRITE;
+    qapi_event_send_block_io_error(bdrv_get_device_name(bs), ac, action,
+                                   bdrv_iostatus_is_enabled(bs),
+                                   error == ENOSPC, strerror(error),
+								   res, info, &error_abort);
+}
+
 /* This is done by device models because, while the block layer knows
  * about the error, it does not know whether an operation comes from
  * the device or the block layer (from a job, for example).
@@ -3603,7 +3646,15 @@ BlockErrorAction bdrv_get_error_action(BlockDriverState *bs, bool is_read, int e
 void bdrv_error_action(BlockDriverState *bs, BlockErrorAction action,
                        bool is_read, int error)
 {
+    RHEL7BlockErrorReason res;
+    RHEL7BlockErrorDebugInfo info;
+
     assert(error >= 0);
+    res = get_rhel7_error_reason(error);
+    get_rhel7_error_debug_info(&info, error);
+
+    fprintf(stderr, "block I/O error in device '%s': %s (%d)\n",
+                    bdrv_get_device_name(bs), info.message, (int) info.q_errno);
 
     if (action == BLOCK_ERROR_ACTION_STOP) {
         /* First set the iostatus, so that "info block" returns an iostatus
@@ -3621,16 +3672,10 @@ void bdrv_error_action(BlockDriverState *bs, BlockErrorAction action,
          * also ensures that the STOP/RESUME pair of events is emitted.
          */
         qemu_system_vmstop_request_prepare();
-        qapi_event_send_block_io_error(bdrv_get_device_name(bs),
-                                       is_read ? IO_OPERATION_TYPE_READ :
-                                       IO_OPERATION_TYPE_WRITE,
-                                       action, &error_abort);
+        send_qmp_error_event(bs, action, is_read, error, res, &info);
         qemu_system_vmstop_request(RUN_STATE_IO_ERROR);
     } else {
-        qapi_event_send_block_io_error(bdrv_get_device_name(bs),
-                                       is_read ? IO_OPERATION_TYPE_READ :
-                                       IO_OPERATION_TYPE_WRITE,
-                                       action, &error_abort);
+        send_qmp_error_event(bs, action, is_read, error, res, &info);
     }
 }
 
@@ -4498,6 +4543,12 @@ static int multiwrite_merge(BlockDriverState *bs, BlockRequest *reqs,
             // Add the second request
             qemu_iovec_concat(qiov, reqs[i].qiov, 0, reqs[i].qiov->size);
 
+            // Add tail of first request, if necessary
+            if (qiov->size < reqs[outidx].qiov->size) {
+                qemu_iovec_concat(qiov, reqs[outidx].qiov, qiov->size,
+                                  reqs[outidx].qiov->size - qiov->size);
+            }
+
             reqs[outidx].nb_sectors = qiov->size >> 9;
             reqs[outidx].qiov = qiov;
 
@@ -4965,6 +5016,11 @@ void bdrv_invalidate_cache(BlockDriverState *bs, Error **errp)
         return;
     }
 
+    if (!(bs->open_flags & BDRV_O_INCOMING)) {
+        return;
+    }
+    bs->open_flags &= ~BDRV_O_INCOMING;
+
     if (bs->drv->bdrv_invalidate_cache) {
         bs->drv->bdrv_invalidate_cache(bs, &local_err);
     } else if (bs->file) {
@@ -4997,19 +5053,6 @@ void bdrv_invalidate_cache_all(Error **errp)
             error_propagate(errp, local_err);
             return;
         }
-    }
-}
-
-void bdrv_clear_incoming_migration_all(void)
-{
-    BlockDriverState *bs;
-
-    QTAILQ_FOREACH(bs, &bdrv_states, device_list) {
-        AioContext *aio_context = bdrv_get_aio_context(bs);
-
-        aio_context_acquire(aio_context);
-        bs->open_flags = bs->open_flags & ~(BDRV_O_INCOMING);
-        aio_context_release(aio_context);
     }
 }
 
@@ -5371,6 +5414,9 @@ void bdrv_ref(BlockDriverState *bs)
  * deleted. */
 void bdrv_unref(BlockDriverState *bs)
 {
+    if (!bs) {
+        return;
+    }
     assert(bs->refcnt > 0);
     if (--bs->refcnt == 0) {
         bdrv_delete(bs);

@@ -24,12 +24,20 @@
 typedef struct VirtIOSCSIReq {
     VirtIOSCSI *dev;
     VirtQueue *vq;
-    VirtQueueElement elem;
     QEMUSGList qsgl;
+    QEMUIOVector resp_iov;
+
+    /* Note:
+     * - fields before elem are initialized by virtio_scsi_init_req;
+     * - elem is uninitialized at the time of allocation.
+     * - fields after elem (except the ending cdb[]) are zeroed by
+     *   virtio_scsi_init_req.
+     * */
+
+    VirtQueueElement elem;
     SCSIRequest *sreq;
     size_t resp_size;
     enum SCSIXferMode mode;
-    QEMUIOVector resp_iov;
     union {
         VirtIOSCSICmdResp     cmd;
         VirtIOSCSICtrlTMFResp tmf;
@@ -68,23 +76,26 @@ static inline SCSIDevice *virtio_scsi_device_find(VirtIOSCSI *s, uint8_t *lun)
 static VirtIOSCSIReq *virtio_scsi_init_req(VirtIOSCSI *s, VirtQueue *vq)
 {
     VirtIOSCSIReq *req;
-    VirtIOSCSICommon *vs = VIRTIO_SCSI_COMMON(s);
+    VirtIOSCSICommon *vs = (VirtIOSCSICommon *)s;
+    const size_t zero_skip = offsetof(VirtIOSCSIReq, elem)
+                             + sizeof(VirtQueueElement);
 
-    req = g_malloc0(sizeof(*req) + vs->cdb_size);
-
+    req = g_slice_alloc(sizeof(*req) + vs->cdb_size);
     req->vq = vq;
     req->dev = s;
-    req->sreq = NULL;
     qemu_sglist_init(&req->qsgl, DEVICE(s), 8, &address_space_memory);
     qemu_iovec_init(&req->resp_iov, 1);
+    memset((uint8_t *)req + zero_skip, 0, sizeof(*req) - zero_skip);
     return req;
 }
 
 static void virtio_scsi_free_req(VirtIOSCSIReq *req)
 {
+    VirtIOSCSICommon *vs = (VirtIOSCSICommon *)req->dev;
+
     qemu_iovec_destroy(&req->resp_iov);
     qemu_sglist_destroy(&req->qsgl);
-    g_free(req);
+    g_slice_free1(sizeof(*req) + vs->cdb_size, req);
 }
 
 static void virtio_scsi_complete_req(VirtIOSCSIReq *req)
@@ -135,6 +146,7 @@ static size_t qemu_sgl_concat(VirtIOSCSIReq *req, struct iovec *iov,
 static int virtio_scsi_parse_req(VirtIOSCSIReq *req,
                                  unsigned req_size, unsigned resp_size)
 {
+    VirtIODevice *vdev = (VirtIODevice *) req->dev;
     size_t in_size, out_size;
 
     if (iov_to_buf(req->elem.out_sg, req->elem.out_num, 0,
@@ -147,7 +159,23 @@ static int virtio_scsi_parse_req(VirtIOSCSIReq *req,
                               resp_size) < resp_size) {
         return -EINVAL;
     }
+
     req->resp_size = resp_size;
+
+    /* Old BIOSes left some padding by mistake after the req_size/resp_size.
+     * As a workaround, always consider the first buffer as the virtio-scsi
+     * request/response, making the payload start at the second element
+     * of the iovec.
+     *
+     * The actual length of the response header, stored in req->resp_size,
+     * does not change.
+     *
+     * TODO: always disable this workaround for virtio 1.0 devices.
+     */
+    if ((vdev->guest_features & VIRTIO_F_ANY_LAYOUT) == 0) {
+        req_size = req->elem.out_sg[0].iov_len;
+        resp_size = req->elem.in_sg[0].iov_len;
+    }
 
     out_size = qemu_sgl_concat(req, req->elem.out_sg,
                                &req->elem.out_addr[0], req->elem.out_num,
@@ -400,10 +428,34 @@ static void virtio_scsi_command_complete(SCSIRequest *r, uint32_t status,
         sense_len = scsi_req_get_sense(r, sense, sizeof(sense));
         sense_len = MIN(sense_len, req->resp_iov.size - sizeof(req->resp.cmd));
         qemu_iovec_from_buf(&req->resp_iov, sizeof(req->resp.cmd),
-                            &req->resp, sense_len);
+                            sense, sense_len);
         req->resp.cmd.sense_len = virtio_tswap32(vdev, sense_len);
     }
     virtio_scsi_complete_cmd_req(req);
+}
+
+static int virtio_scsi_parse_cdb(SCSIDevice *dev, SCSICommand *cmd,
+                                 uint8_t *buf, void *hba_private)
+{
+    VirtIOSCSIReq *req = hba_private;
+
+    if (cmd->len == 0) {
+        cmd->len = MIN(VIRTIO_SCSI_CDB_SIZE, SCSI_CMD_BUF_SIZE);
+        memcpy(cmd->buf, buf, cmd->len);
+    }
+
+    /* Extract the direction and mode directly from the request, for
+     * host device passthrough.
+     */
+    cmd->xfer = req->qsgl.size;
+    if (cmd->xfer == 0) {
+        cmd->mode = SCSI_XFER_NONE;
+    } else if (iov_size(req->elem.in_sg, req->elem.in_num) > req->resp_size) {
+        cmd->mode = SCSI_XFER_FROM_DEV;
+    } else {
+        cmd->mode = SCSI_XFER_TO_DEV;
+    }
+    return 0;
 }
 
 static QEMUSGList *virtio_scsi_get_sg_list(SCSIRequest *r)
@@ -658,6 +710,7 @@ static struct SCSIBusInfo virtio_scsi_scsi_info = {
     .change = virtio_scsi_change,
     .hotplug = virtio_scsi_hotplug,
     .hot_unplug = virtio_scsi_hot_unplug,
+    .parse_cdb = virtio_scsi_parse_cdb,
     .get_sg_list = virtio_scsi_get_sg_list,
     .save_request = virtio_scsi_save_request,
     .load_request = virtio_scsi_load_request,
@@ -674,6 +727,14 @@ void virtio_scsi_common_realize(DeviceState *dev, Error **errp,
     virtio_init(vdev, "virtio-scsi", VIRTIO_ID_SCSI,
                 sizeof(VirtIOSCSIConfig));
 
+    if (s->conf.num_queues == 0 ||
+            s->conf.num_queues > VIRTIO_PCI_QUEUE_MAX - 2) {
+        error_setg(errp, "Invalid number of queues (= %" PRIu32 "), "
+                         "must be a positive integer less than %d.",
+                   s->conf.num_queues, VIRTIO_PCI_QUEUE_MAX - 2);
+        virtio_cleanup(vdev);
+        return;
+    }
     s->cmd_vqs = g_malloc0(s->conf.num_queues * sizeof(VirtQueue *));
     s->sense_size = VIRTIO_SCSI_SENSE_SIZE;
     s->cdb_size = VIRTIO_SCSI_CDB_SIZE;

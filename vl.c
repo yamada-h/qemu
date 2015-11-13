@@ -134,6 +134,7 @@ const char* keyboard_layout = NULL;
 ram_addr_t ram_size;
 const char *mem_path = NULL;
 int mem_prealloc = 0; /* force preallocation of physical target memory */
+bool enable_mlock = false;
 int nb_nics;
 NICInfo nd_table[MAX_NICS];
 int autostart;
@@ -161,7 +162,7 @@ int smp_threads = 1;
 const char *vnc_display;
 #endif
 int acpi_enabled = 1;
-int no_hpet = 0;
+int no_hpet = 1; /* Always disabled for Red Hat Enterprise Linux */
 int fd_bootchk = 1;
 static int no_reboot;
 int no_shutdown = 0;
@@ -199,6 +200,9 @@ int nb_numa_nodes;
 int max_numa_nodeid;
 NodeInfo numa_info[MAX_NODES];
 
+/* The bytes in qemu_uuid[] are in the order specified by RFC4122, _not_ in the
+ * little-endian "wire format" described in the SMBIOS 2.6 specification.
+ */
 uint8_t qemu_uuid[16];
 bool qemu_uuid_set;
 
@@ -1146,6 +1150,7 @@ static void default_drive(int enable, int snapshot, BlockInterfaceType type,
                           int index, const char *optstr)
 {
     QemuOpts *opts;
+    DriveInfo *dinfo;
 
     if (!enable || drive_get_by_index(type, index)) {
         return;
@@ -1155,9 +1160,13 @@ static void default_drive(int enable, int snapshot, BlockInterfaceType type,
     if (snapshot) {
         drive_enable_snapshot(opts, NULL);
     }
-    if (!drive_new(opts, type)) {
+
+    dinfo = drive_new(opts, type);
+    if (!dinfo) {
         exit(1);
     }
+    dinfo->is_default = true;
+
 }
 
 void qemu_register_boot_set(QEMUBootSetHandler *func, void *opaque)
@@ -1399,12 +1408,8 @@ static void smp_parse(QemuOpts *opts)
 
 }
 
-static void configure_realtime(QemuOpts *opts)
+static void realtime_init(void)
 {
-    bool enable_mlock;
-
-    enable_mlock = qemu_opt_get_bool(opts, "mlock", true);
-
     if (enable_mlock) {
         if (os_mlock() < 0) {
             fprintf(stderr, "qemu: locking memory failed\n");
@@ -1553,6 +1558,7 @@ static void machine_class_init(ObjectClass *oc, void *data)
     MachineClass *mc = MACHINE_CLASS(oc);
     QEMUMachine *qm = data;
 
+    mc->family = qm->family;
     mc->name = qm->name;
     mc->alias = qm->alias;
     mc->desc = qm->desc;
@@ -1561,6 +1567,7 @@ static void machine_class_init(ObjectClass *oc, void *data)
     mc->hot_add_cpu = qm->hot_add_cpu;
     mc->kvm_type = qm->kvm_type;
     mc->block_default_type = qm->block_default_type;
+    mc->units_per_default_bus = qm->units_per_default_bus;
     mc->max_cpus = qm->max_cpus;
     mc->no_serial = qm->no_serial;
     mc->no_parallel = qm->no_parallel;
@@ -2019,9 +2026,17 @@ static void version(void)
     printf("QEMU emulator version " QEMU_VERSION QEMU_PKGVERSION ", Copyright (c) 2003-2008 Fabrice Bellard\n");
 }
 
+static void print_rh_warning(void)
+{
+    printf("\nWARNING: Direct use of qemu-kvm from the command line is not supported by Red Hat.\n"
+             "WARNING: Use libvirt as the stable management interface.\n"
+             "WARNING: Some command line options listed here may not be available in future releases.\n\n");
+}
+
 static void help(int exitcode)
 {
     version();
+    print_rh_warning();
     printf("usage: %s [options] [disk_image]\n\n"
            "'disk_image' is a raw hard disk image for IDE hard disk 0\n\n",
             error_get_progname());
@@ -2036,6 +2051,7 @@ static void help(int exitcode)
            "\n"
            "When using -nographic, press 'ctrl-a h' to get some help.\n");
 
+    print_rh_warning();
     exit(exitcode);
 }
 
@@ -2625,7 +2641,41 @@ static int debugcon_parse(const char *devname)
     return 0;
 }
 
-static MachineClass *machine_parse(const char *name)
+static gint machine_class_cmp(gconstpointer a, gconstpointer b)
+{
+    const MachineClass *mc1 = a, *mc2 = b;
+    int res;
+
+    if (mc1->family == NULL) {
+        if (mc2->family == NULL) {
+            /* Compare standalone machine types against each other; they sort
+             * in increasing order.
+             */
+            return strcmp(object_class_get_name(OBJECT_CLASS(mc1)),
+                          object_class_get_name(OBJECT_CLASS(mc2)));
+        }
+
+        /* Standalone machine types sort after families. */
+        return 1;
+    }
+
+    if (mc2->family == NULL) {
+        /* Families sort before standalone machine types. */
+        return -1;
+    }
+
+    /* Families sort between each other alphabetically increasingly. */
+    res = strcmp(mc1->family, mc2->family);
+    if (res != 0) {
+        return res;
+    }
+
+    /* Within the same family, machine types sort in decreasing order. */
+    return strcmp(object_class_get_name(OBJECT_CLASS(mc2)),
+                  object_class_get_name(OBJECT_CLASS(mc1)));
+}
+
+ static MachineClass *machine_parse(const char *name)
 {
     MachineClass *mc = NULL;
     GSList *el, *machines = object_class_get_list(TYPE_MACHINE, false);
@@ -2641,6 +2691,7 @@ static MachineClass *machine_parse(const char *name)
         error_printf("Use -machine help to list supported machines!\n");
     } else {
         printf("Supported machines are:\n");
+        machines = g_slist_sort(machines, machine_class_cmp);
         for (el = machines; el; el = el->next) {
             MachineClass *mc = el->data;
             if (mc->alias) {
@@ -2685,7 +2736,7 @@ static int configure_accelerator(MachineClass *mc)
     p = qemu_opt_get(qemu_get_machine_opts(), "accel");
     if (p == NULL) {
         /* Use the default "accelerator", tcg */
-        p = "tcg";
+        p = "kvm:tcg";
     }
 
     while (!accel_initialised && *p != '\0') {
@@ -2958,6 +3009,7 @@ int main(int argc, char **argv, char **envp)
     qemu_add_drive_opts(&qemu_legacy_drive_opts);
     qemu_add_drive_opts(&qemu_common_drive_opts);
     qemu_add_drive_opts(&qemu_drive_opts);
+    qemu_add_opts(&qemu_simple_drive_opts);
     qemu_add_opts(&qemu_chardev_opts);
     qemu_add_opts(&qemu_device_opts);
     qemu_add_opts(&qemu_netdev_opts);
@@ -3320,6 +3372,7 @@ int main(int argc, char **argv, char **envp)
                 }
 
                 sz = QEMU_ALIGN_UP(sz, 8192);
+                sz = MAX(sz, 2 * 1024 * 1024);
                 ram_size = sz;
                 if (ram_size != sz) {
                     error_report("ram size too large");
@@ -3945,7 +3998,7 @@ int main(int argc, char **argv, char **envp)
                 if (!opts) {
                     exit(1);
                 }
-                configure_realtime(opts);
+                enable_mlock = qemu_opt_get_bool(opts, "mlock", true);
                 break;
             case QEMU_OPTION_msg:
                 opts = qemu_opts_parse(qemu_find_opts("msg"), optarg, 0);
@@ -4340,6 +4393,13 @@ int main(int argc, char **argv, char **envp)
     blk_mig_init();
     ram_mig_init();
 
+    /* If the currently selected machine wishes to override the units-per-bus
+     * property of its default HBA interface type, do so now. */
+    if (machine_class->units_per_default_bus) {
+        override_max_devs(machine_class->block_default_type,
+                          machine_class->units_per_default_bus);
+    }
+
     /* open the virtual block devices */
     if (snapshot)
         qemu_opts_foreach(qemu_find_opts("drive"), drive_enable_snapshot, NULL, 0);
@@ -4409,6 +4469,8 @@ int main(int argc, char **argv, char **envp)
 
     machine_class->init(current_machine);
 
+    realtime_init();
+
     audio_init();
 
     cpu_synchronize_all_post_init();
@@ -4424,6 +4486,9 @@ int main(int argc, char **argv, char **envp)
     /* init generic devices */
     if (qemu_opts_foreach(qemu_find_opts("device"), device_init_func, NULL, 1) != 0)
         exit(1);
+
+    /* Did we create any drives that we failed to create a device for? */
+    drive_check_orphaned();
 
     net_check_clients();
 

@@ -53,6 +53,7 @@ static bool has_pci_info;
 static bool has_acpi_build = true;
 static bool smbios_defaults = true;
 static bool smbios_legacy_mode;
+static bool smbios_uuid_encoded = true;
 /* Make sure that guest addresses aligned at 1Gbyte boundaries get mapped to
  * host addresses aligned at 1Gbyte boundaries.  This way we can use 1GByte
  * pages in the host.
@@ -87,6 +88,7 @@ static void pc_q35_init(MachineState *machine)
     DeviceState *icc_bridge;
     PcGuestInfo *guest_info;
     ram_addr_t lowmem;
+    DriveInfo *hd[MAX_SATA_PORTS];
 
     /* Check whether RAM fits below 4G (leaving 1/2 GByte for IO memory
      * and 256 Mbytes for PCI Express Enhanced Configuration Access Mapping
@@ -163,8 +165,8 @@ static void pc_q35_init(MachineState *machine)
     if (smbios_defaults) {
         MachineClass *mc = MACHINE_GET_CLASS(machine);
         /* These values are guest ABI, do not change */
-        smbios_set_defaults("QEMU", "Standard PC (Q35 + ICH9, 2009)",
-                            mc->name, smbios_legacy_mode);
+        smbios_set_defaults("Red Hat", "KVM", mc->desc, smbios_legacy_mode,
+                            smbios_uuid_encoded);
     }
 
     /* allocate ram and load rom/bios */
@@ -255,6 +257,9 @@ static void pc_q35_init(MachineState *machine)
                                            true, "ich9-ahci");
     idebus[0] = qdev_get_child_bus(&ahci->qdev, "ide.0");
     idebus[1] = qdev_get_child_bus(&ahci->qdev, "ide.1");
+    g_assert_cmpint(MAX_SATA_PORTS, ==, ICH_AHCI(ahci)->ahci.ports);
+    ide_drive_get(hd, ICH_AHCI(ahci)->ahci.ports);
+    ahci_ide_create_devs(ahci, hd);
 
     if (usb_enabled(false)) {
         /* Should we create 6 UHCI according to ich9 spec? */
@@ -278,6 +283,7 @@ static void pc_q35_init(MachineState *machine)
     }
 }
 
+#if 0 /* Disabled for Red Hat Enterprise Linux */
 static void pc_compat_2_0(MachineState *machine)
 {
     smbios_legacy_mode = true;
@@ -346,8 +352,10 @@ static void pc_q35_init_1_4(MachineState *machine)
 
 #define PC_Q35_MACHINE_OPTIONS \
     PC_DEFAULT_MACHINE_OPTIONS, \
+    .family = "pc_q35", \
     .desc = "Standard PC (Q35 + ICH9, 2009)", \
-    .hot_add_cpu = pc_hot_add_cpu
+    .hot_add_cpu = pc_hot_add_cpu, \
+    .units_per_default_bus = 1
 
 #define PC_Q35_2_1_MACHINE_OPTIONS                      \
     PC_Q35_MACHINE_OPTIONS,                             \
@@ -431,3 +439,93 @@ static void pc_q35_machine_init(void)
 }
 
 machine_init(pc_q35_machine_init);
+
+#endif  /* Disabled for Red Hat Enterprise Linux */
+
+/* Red Hat Enterprise Linux machine types */
+
+static void pc_q35_compat_rhel710(MachineState *machine)
+{
+    /* KVM can't expose RDTSCP on AMD CPUs, so there's no point in enabling it
+     * on AMD CPU models.
+     */
+    x86_cpu_compat_set_features("phenom", FEAT_8000_0001_EDX, 0,
+                                CPUID_EXT2_RDTSCP);
+    x86_cpu_compat_set_features("Opteron_G2", FEAT_8000_0001_EDX, 0,
+                                CPUID_EXT2_RDTSCP);
+    x86_cpu_compat_set_features("Opteron_G3", FEAT_8000_0001_EDX, 0,
+                                CPUID_EXT2_RDTSCP);
+    x86_cpu_compat_set_features("Opteron_G4", FEAT_8000_0001_EDX, 0,
+                                CPUID_EXT2_RDTSCP);
+    x86_cpu_compat_set_features("Opteron_G5", FEAT_8000_0001_EDX, 0,
+                                CPUID_EXT2_RDTSCP);
+}
+
+static void pc_q35_init_rhel710(MachineState *machine)
+{
+    pc_q35_compat_rhel710(machine);
+    pc_q35_init(machine);
+}
+
+static QEMUMachine pc_q35_machine_rhel710 = {
+    PC_DEFAULT_MACHINE_OPTIONS,
+    .family = "pc_q35_Z",
+    .name = "pc-q35-rhel7.1.0",
+    .alias = "q35",
+    .desc = "RHEL-7.1.0 PC (Q35 + ICH9, 2009)",
+    .init = pc_q35_init_rhel710,
+    .default_machine_opts = "firmware=bios-256k.bin",
+    .compat_props = (GlobalProperty[]) {
+        { /* end of list */ }
+    },
+};
+
+static void pc_q35_compat_rhel700(MachineState *machine)
+{
+    pc_q35_compat_rhel710(machine);
+
+    /* Upstream enables it for everyone, we're a little more selective */
+    x86_cpu_compat_disable_kvm_features(FEAT_1_ECX, CPUID_EXT_X2APIC);
+
+    x86_cpu_compat_set_features("Conroe", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+    x86_cpu_compat_set_features("Penryn", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+    x86_cpu_compat_set_features("Nehalem", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+    x86_cpu_compat_set_features("Westmere", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+    /* SandyBridge and Haswell already have x2apic enabled */
+    x86_cpu_compat_set_features("Opteron_G1", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+    x86_cpu_compat_set_features("Opteron_G2", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+    x86_cpu_compat_set_features("Opteron_G3", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+    x86_cpu_compat_set_features("Opteron_G4", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+    x86_cpu_compat_set_features("Opteron_G5", FEAT_1_ECX, CPUID_EXT_X2APIC, 0);
+
+    smbios_legacy_mode = true;
+    has_reserved_memory = false;
+    migrate_cve_2014_5263_xhci_fields = true;
+}
+
+static void pc_q35_init_rhel700(MachineState *machine)
+{
+    pc_q35_compat_rhel700(machine);
+    pc_q35_init(machine);
+}
+
+static QEMUMachine pc_q35_machine_rhel700 = {
+    PC_DEFAULT_MACHINE_OPTIONS,
+    .family = "pc_q35_Z",
+    .name = "pc-q35-rhel7.0.0",
+    .desc = "RHEL-7.0.0 PC (Q35 + ICH9, 2009)",
+    .init = pc_q35_init_rhel700,
+    .default_machine_opts = "firmware=bios-256k.bin",
+    .compat_props = (GlobalProperty[]) {
+        PC_RHEL7_0_COMPAT,
+        { /* end of list */ }
+    },
+};
+
+static void rhel_pc_q35_machine_init(void)
+{
+    qemu_register_pc_machine(&pc_q35_machine_rhel710);
+    qemu_register_pc_machine(&pc_q35_machine_rhel700);
+}
+
+machine_init(rhel_pc_q35_machine_init);

@@ -484,15 +484,23 @@ static void migration_bitmap_sync_range(ram_addr_t start, ram_addr_t length)
 
 
 /* Needs iothread lock! */
+/* Fix me: there are too many global variables used in migration process. */
+static int64_t start_time;
+static int64_t bytes_xfer_prev;
+static int64_t num_dirty_pages_period;
+
+static void migration_bitmap_sync_init(void)
+{
+    start_time = 0;
+    bytes_xfer_prev = 0;
+    num_dirty_pages_period = 0;
+}
 
 static void migration_bitmap_sync(void)
 {
     RAMBlock *block;
     uint64_t num_dirty_pages_init = migration_dirty_pages;
     MigrationState *s = migrate_get_current();
-    static int64_t start_time;
-    static int64_t bytes_xfer_prev;
-    static int64_t num_dirty_pages_period;
     int64_t end_time;
     int64_t bytes_xfer_now;
     static uint64_t xbzrle_cache_miss_prev;
@@ -772,6 +780,7 @@ static int ram_save_setup(QEMUFile *f, void *opaque)
     mig_throttle_on = false;
     dirty_rate_high_cnt = 0;
     bitmap_sync_count = 0;
+    migration_bitmap_sync_init();
 
     if (migrate_use_xbzrle()) {
         XBZRLE_cache_lock();
@@ -1004,7 +1013,7 @@ static inline void *host_from_stream_offset(QEMUFile *f,
     uint8_t len;
 
     if (flags & RAM_SAVE_FLAG_CONTINUE) {
-        if (!block) {
+        if (!block || block->length <= offset) {
             error_report("Ack, bad migration stream!");
             return NULL;
         }
@@ -1017,8 +1026,9 @@ static inline void *host_from_stream_offset(QEMUFile *f,
     id[len] = 0;
 
     QTAILQ_FOREACH(block, &ram_list.blocks, next) {
-        if (!strncmp(id, block->idstr, sizeof(id)))
+        if (!strncmp(id, block->idstr, sizeof(id)) && block->length > offset) {
             return memory_region_get_ram_ptr(block->mr) + offset;
+        }
     }
 
     error_report("Can't find block %s!", id);
@@ -1077,6 +1087,8 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
                                          block->length);
                             ret =  -EINVAL;
                         }
+                        ram_control_load_hook(f, RAM_CONTROL_BLOCK_REG,
+                                              block->idstr);
                         break;
                     }
                 }
@@ -1131,7 +1143,7 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
                 break;
             }
         } else if (flags & RAM_SAVE_FLAG_HOOK) {
-            ram_control_load_hook(f, flags);
+            ram_control_load_hook(f, RAM_CONTROL_HOOK, NULL);
         } else if (flags & RAM_SAVE_FLAG_EOS) {
             /* normal exit */
             break;

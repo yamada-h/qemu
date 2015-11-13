@@ -1031,7 +1031,7 @@ void qemu_mutex_unlock_ramlist(void)
 
 #define HUGETLBFS_MAGIC       0x958458f6
 
-static long gethugepagesize(const char *path)
+static long gethugepagesize(const char *path, Error **errp)
 {
     struct statfs fs;
     int ret;
@@ -1041,7 +1041,8 @@ static long gethugepagesize(const char *path)
     } while (ret != 0 && errno == EINTR);
 
     if (ret != 0) {
-        perror(path);
+        error_setg_errno(errp, errno, "failed to get page size of file %s",
+                         path);
         return 0;
     }
 
@@ -1059,17 +1060,22 @@ static void *file_ram_alloc(RAMBlock *block,
     char *filename;
     char *sanitized_name;
     char *c;
-    void *area;
+    void *area = NULL;
     int fd;
-    unsigned long hpagesize;
+    uint64_t hpagesize;
+    Error *local_err = NULL;
 
-    hpagesize = gethugepagesize(path);
-    if (!hpagesize) {
+    hpagesize = gethugepagesize(path, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
         goto error;
     }
 
     if (memory < hpagesize) {
-        return NULL;
+        error_setg(errp, "memory size 0x" RAM_ADDR_FMT " must be equal to "
+                   "or larger than huge page size 0x%" PRIx64,
+                   memory, hpagesize);
+        goto error;
     }
 
     if (kvm_enabled() && !kvm_has_sync_mmu()) {
@@ -1130,6 +1136,7 @@ static void *file_ram_alloc(RAMBlock *block,
 
 error:
     if (mem_prealloc) {
+        error_report("%s\n", error_get_pretty(*errp));
         exit(1);
     }
     return NULL;
@@ -2008,10 +2015,8 @@ int cpu_memory_rw_debug(CPUState *cpu, target_ulong addr,
 static void invalidate_and_set_dirty(hwaddr addr,
                                      hwaddr length)
 {
-    if (cpu_physical_memory_is_clean(addr)) {
-        /* invalidate code */
-        tb_invalidate_phys_page_range(addr, addr + length, 0);
-        /* set dirty bit */
+    if (cpu_physical_memory_range_includes_clean(addr, length)) {
+        tb_invalidate_phys_range(addr, addr + length, 0);
         cpu_physical_memory_set_dirty_range_nocode(addr, length);
     }
     xen_modified_memory(addr, length);
@@ -2809,12 +2814,18 @@ bool cpu_physical_memory_is_io(hwaddr phys_addr)
              memory_region_is_romd(mr));
 }
 
-void qemu_ram_foreach_block(RAMBlockIterFunc func, void *opaque)
+int qemu_ram_foreach_block(RAMBlockIterFunc func, void *opaque)
 {
     RAMBlock *block;
+    int ret = 0;
 
     QTAILQ_FOREACH(block, &ram_list.blocks, next) {
-        func(block->host, block->offset, block->length, opaque);
+        ret = func(block->idstr, block->host, block->offset,
+                   block->length, opaque);
+        if (ret) {
+            break;
+        }
     }
+    return ret;
 }
 #endif

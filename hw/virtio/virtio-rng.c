@@ -16,6 +16,7 @@
 #include "hw/virtio/virtio-rng.h"
 #include "sysemu/rng.h"
 #include "qom/object_interfaces.h"
+#include "trace.h"
 
 static bool is_guest_ready(VirtIORNG *vrng)
 {
@@ -24,6 +25,7 @@ static bool is_guest_ready(VirtIORNG *vrng)
         && (vdev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
         return true;
     }
+    trace_virtio_rng_guest_not_ready(vrng);
     return false;
 }
 
@@ -62,6 +64,7 @@ static void chr_read(void *opaque, const void *buf, size_t size)
         offset += len;
 
         virtqueue_push(vrng->vq, &elem, len);
+        trace_virtio_rng_pushed(vrng, len);
     }
     virtio_notify(vdev, vrng->vq);
 }
@@ -81,6 +84,9 @@ static void virtio_rng_process(VirtIORNG *vrng)
         quota = MIN((uint64_t)vrng->quota_remaining, (uint64_t)UINT32_MAX);
     }
     size = get_request_size(vrng->vq, quota);
+
+    trace_virtio_rng_request(vrng, size, quota);
+
     size = MIN(vrng->quota_remaining, size);
     if (size) {
         rng_backend_request_entropy(vrng->rng, size, chr_read, vrng);
@@ -107,20 +113,22 @@ static void virtio_rng_save(QEMUFile *f, void *opaque)
 
 static int virtio_rng_load(QEMUFile *f, void *opaque, int version_id)
 {
+    VirtIORNG *vrng = opaque;
+    int ret;
+
     if (version_id != 1) {
         return -EINVAL;
     }
-    return virtio_load(VIRTIO_DEVICE(opaque), f, version_id);
-}
+    ret = virtio_load(VIRTIO_DEVICE(vrng), f, version_id);
+    if (ret != 0) {
+        return ret;
+    }
 
-static int virtio_rng_load_device(VirtIODevice *vdev, QEMUFile *f,
-                                  int version_id)
-{
     /* We may have an element ready but couldn't process it due to a quota
      * limit.  Make sure to try again after live migration when the quota may
      * have been reset.
      */
-    virtio_rng_process(VIRTIO_RNG(vdev));
+    virtio_rng_process(vrng);
 
     return 0;
 }
@@ -226,7 +234,6 @@ static void virtio_rng_class_init(ObjectClass *klass, void *data)
     vdc->realize = virtio_rng_device_realize;
     vdc->unrealize = virtio_rng_device_unrealize;
     vdc->get_features = get_features;
-    vdc->load = virtio_rng_load_device;
 }
 
 static void virtio_rng_initfn(Object *obj)

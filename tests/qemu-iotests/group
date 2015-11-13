@@ -77,7 +77,7 @@
 068 rw auto quick
 069 rw auto quick
 070 rw auto quick
-071 rw auto quick
+# 071 rw auto quick -- requires whitelisted blkverify
 072 rw auto quick
 073 rw auto quick
 074 rw auto quick
@@ -100,4 +100,6 @@
 091 rw auto quick
 092 rw auto quick
 095 rw auto quick
+100 rw auto quick
 101 rw auto quick
+105 rw auto quick

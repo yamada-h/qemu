@@ -194,6 +194,7 @@
 #       'file', 'file', 'ftp', 'ftps', 'host_cdrom', 'host_device',
 #       'host_floppy', 'http', 'https', 'nbd', 'parallels', 'qcow',
 #       'qcow2', 'raw', 'tftp', 'vdi', 'vmdk', 'vpc', 'vvfat'
+#       2.2: 'cow' dropped
 #
 # @backing_file: #optional the name of the backing file (for copy-on-write)
 #
@@ -332,6 +333,7 @@
 #
 # @io-status: #optional @BlockDeviceIoStatus. Only present if the device
 #             supports it and the VM is configured to stop on errors
+#             (supported device models: virtio-blk, ide, scsi-disk)
 #
 # @inserted: #optional @BlockDeviceInfo describing the device if media is
 #            present
@@ -1145,7 +1147,7 @@
 { 'enum': 'BlockdevDriver',
   'data': [ 'file', 'host_device', 'host_cdrom', 'host_floppy',
             'http', 'https', 'ftp', 'ftps', 'tftp', 'vvfat', 'blkdebug',
-            'blkverify', 'bochs', 'cloop', 'cow', 'dmg', 'parallels', 'qcow',
+            'blkverify', 'bochs', 'cloop', 'dmg', 'parallels', 'qcow',
             'qcow2', 'qed', 'raw', 'vdi', 'vhdx', 'vmdk', 'vpc', 'quorum' ] }
 
 ##
@@ -1437,7 +1439,6 @@
       'blkverify':  'BlockdevOptionsBlkverify',
       'bochs':      'BlockdevOptionsGenericFormat',
       'cloop':      'BlockdevOptionsGenericFormat',
-      'cow':        'BlockdevOptionsGenericCOWFormat',
       'dmg':        'BlockdevOptionsGenericFormat',
       'parallels':  'BlockdevOptionsGenericFormat',
       'qcow':       'BlockdevOptionsGenericCOWFormat',
@@ -1496,6 +1497,24 @@
 { 'enum': 'BlockErrorAction',
   'data': [ 'ignore', 'report', 'stop' ] }
 
+##
+# @RHEL7BlockErrorReason
+#
+# Block I/O error reason
+##
+{ 'enum': 'RHEL7BlockErrorReason',
+  'data': [ 'enospc', 'eperm', 'eio', 'eother' ] }
+
+##
+# @RHEL7BlockErrorDebugInfo
+#
+# Debug information for a block I/O error
+#
+# @message: error message returned by strerror()
+# @errno: errno value
+##
+{ 'type': 'RHEL7BlockErrorDebugInfo',
+  'data': { 'message': 'str', 'errno': 'int' } }
 
 ##
 # @BLOCK_IMAGE_CORRUPTED
@@ -1533,6 +1552,21 @@
 #
 # @action: action that has been taken
 #
+# @nospace: #optional true if I/O error was caused due to a no-space
+#           condition. This key is only present if query-block's
+#           io-status is present, please see query-block documentation
+#           for more information (since: 2.2)
+#
+# @reason: human readable string describing the error cause.
+#          (This field is a debugging aid for humans, it should not
+#           be parsed by applications) (since: 2.2)
+#
+# @__com.redhat_reason: error reason (RHEL7 vendor extension)
+#
+# @__com.redhat_debug_info: debug information for humans, applications
+#                           should NOT read any information from this
+#                           member (RHEL7 vendor extension)
+#
 # Note: If action is "stop", a STOP event will eventually follow the
 # BLOCK_IO_ERROR event
 #
@@ -1540,7 +1574,10 @@
 ##
 { 'event': 'BLOCK_IO_ERROR',
   'data': { 'device': 'str', 'operation': 'IoOperationType',
-            'action': 'BlockErrorAction' } }
+            'action': 'BlockErrorAction', '*nospace': 'bool',
+            'reason': 'str',
+            '__com.redhat_reason': 'RHEL7BlockErrorReason',
+            '__com.redhat_debug_info': 'RHEL7BlockErrorDebugInfo' } }
 
 ##
 # @BLOCK_JOB_COMPLETED

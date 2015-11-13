@@ -37,6 +37,7 @@
 #include "sysemu/sysemu.h"
 #include "sysemu/kvm.h"
 #include "hw/boards.h"
+#include "hw/loader.h"
 #include "exec/address-spaces.h"
 #include "qemu/bitops.h"
 #include "qemu/error-report.h"
@@ -238,14 +239,23 @@ static void fdt_add_timer_nodes(const VirtBoardInfo *vbi)
      * but for the GIC implementation provided by both QEMU and KVM
      * they are edge-triggered.
      */
+    ARMCPU *armcpu;
     uint32_t irqflags = GIC_FDT_IRQ_FLAGS_EDGE_LO_HI;
 
     irqflags = deposit32(irqflags, GIC_FDT_IRQ_PPI_CPU_START,
                          GIC_FDT_IRQ_PPI_CPU_WIDTH, (1 << vbi->smp_cpus) - 1);
 
     qemu_fdt_add_subnode(vbi->fdt, "/timer");
-    qemu_fdt_setprop_string(vbi->fdt, "/timer",
-                                "compatible", "arm,armv7-timer");
+
+    armcpu = ARM_CPU(qemu_get_cpu(0));
+    if (arm_feature(&armcpu->env, ARM_FEATURE_V8)) {
+        const char compat[] = "arm,armv8-timer\0arm,armv7-timer";
+        qemu_fdt_setprop(vbi->fdt, "/timer", "compatible",
+                         compat, sizeof(compat));
+    } else {
+        qemu_fdt_setprop_string(vbi->fdt, "/timer", "compatible",
+                                "arm,armv7-timer");
+    }
     qemu_fdt_setprop_cells(vbi->fdt, "/timer", "interrupts",
                                GIC_FDT_IRQ_TYPE_PPI, 13, irqflags,
                                GIC_FDT_IRQ_TYPE_PPI, 14, irqflags,
@@ -376,6 +386,8 @@ static void create_uart(const VirtBoardInfo *vbi, qemu_irq *pic)
                                vbi->clock_phandle, vbi->clock_phandle);
     qemu_fdt_setprop(vbi->fdt, nodename, "clock-names",
                          clocknames, sizeof(clocknames));
+
+    qemu_fdt_setprop_string(vbi->fdt, "/chosen", "linux,stdout-path", nodename);
     g_free(nodename);
 }
 
@@ -437,6 +449,73 @@ static void create_virtio_devices(const VirtBoardInfo *vbi, qemu_irq *pic)
     }
 }
 
+static void create_one_flash(const char *name, hwaddr flashbase,
+                             hwaddr flashsize)
+{
+    /* Create and map a single flash device. We use the same
+     * parameters as the flash devices on the Versatile Express board.
+     */
+    DriveInfo *dinfo = drive_get_next(IF_PFLASH);
+    DeviceState *dev = qdev_create(NULL, "cfi.pflash01");
+    const uint64_t sectorlength = 256 * 1024;
+
+    if (dinfo && qdev_prop_set_drive(dev, "drive", dinfo->bdrv)) {
+        abort();
+    }
+
+    qdev_prop_set_uint32(dev, "num-blocks", flashsize / sectorlength);
+    qdev_prop_set_uint64(dev, "sector-length", sectorlength);
+    qdev_prop_set_uint8(dev, "width", 4);
+    qdev_prop_set_uint8(dev, "device-width", 2);
+    qdev_prop_set_uint8(dev, "big-endian", 0);
+    qdev_prop_set_uint16(dev, "id0", 0x89);
+    qdev_prop_set_uint16(dev, "id1", 0x18);
+    qdev_prop_set_uint16(dev, "id2", 0x00);
+    qdev_prop_set_uint16(dev, "id3", 0x00);
+    qdev_prop_set_string(dev, "name", name);
+    qdev_init_nofail(dev);
+
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, flashbase);
+}
+
+static void create_flash(const VirtBoardInfo *vbi)
+{
+    /* Create two flash devices to fill the VIRT_FLASH space in the memmap.
+     * Any file passed via -bios goes in the first of these.
+     */
+    hwaddr flashsize = vbi->memmap[VIRT_FLASH].size / 2;
+    hwaddr flashbase = vbi->memmap[VIRT_FLASH].base;
+    char *nodename;
+
+    if (bios_name) {
+        const char *fn;
+
+        if (drive_get(IF_PFLASH, 0, 0)) {
+            error_report("The contents of the first flash device may be "
+                         "specified with -bios or with -drive if=pflash... "
+                         "but you cannot use both options at once");
+            exit(1);
+        }
+        fn = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
+        if (!fn || load_image_targphys(fn, flashbase, flashsize) < 0) {
+            error_report("Could not load ROM image '%s'", bios_name);
+            exit(1);
+        }
+    }
+
+    create_one_flash("virt.flash0", flashbase, flashsize);
+    create_one_flash("virt.flash1", flashbase + flashsize, flashsize);
+
+    nodename = g_strdup_printf("/flash@%" PRIx64, flashbase);
+    qemu_fdt_add_subnode(vbi->fdt, nodename);
+    qemu_fdt_setprop_string(vbi->fdt, nodename, "compatible", "cfi-flash");
+    qemu_fdt_setprop_sized_cells(vbi->fdt, nodename, "reg",
+                                 2, flashbase, 2, flashsize,
+                                 2, flashbase + flashsize, 2, flashsize);
+    qemu_fdt_setprop_cell(vbi->fdt, nodename, "bank-width", 4);
+    g_free(nodename);
+}
+
 static void *machvirt_dtb(const struct arm_boot_info *binfo, int *fdt_size)
 {
     const VirtBoardInfo *board = (const VirtBoardInfo *)binfo;
@@ -483,7 +562,6 @@ static void machvirt_init(MachineState *machine)
     }
 
     create_fdt(vbi);
-    fdt_add_timer_nodes(vbi);
 
     for (n = 0; n < smp_cpus; n++) {
         ObjectClass *oc = cpu_class_by_name(TYPE_ARM_CPU, cpu_model);
@@ -507,12 +585,15 @@ static void machvirt_init(MachineState *machine)
 
         object_property_set_bool(cpuobj, true, "realized", NULL);
     }
+    fdt_add_timer_nodes(vbi);
     fdt_add_cpu_nodes(vbi);
     fdt_add_psci_node(vbi);
 
     memory_region_init_ram(ram, NULL, "mach-virt.ram", machine->ram_size);
     vmstate_register_ram_global(ram);
     memory_region_add_subregion(sysmem, vbi->memmap[VIRT_MEM].base, ram);
+
+    create_flash(vbi);
 
     create_gic(vbi, pic);
 
@@ -541,7 +622,7 @@ static QEMUMachine machvirt_a15_machine = {
     .name = "virt",
     .desc = "ARM Virtual Machine",
     .init = machvirt_init,
-    .max_cpus = 4,
+    .max_cpus = 8,
 };
 
 static void machvirt_machine_init(void)

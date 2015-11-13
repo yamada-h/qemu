@@ -75,19 +75,29 @@ static void put_le16(uint16_t *p, unsigned int v)
     *p = cpu_to_le16(v);
 }
 
+static void ide_identify_size(IDEState *s)
+{
+    uint16_t *p = (uint16_t *)s->identify_data;
+    put_le16(p + 60, s->nb_sectors);
+    put_le16(p + 61, s->nb_sectors >> 16);
+    put_le16(p + 100, s->nb_sectors);
+    put_le16(p + 101, s->nb_sectors >> 16);
+    put_le16(p + 102, s->nb_sectors >> 32);
+    put_le16(p + 103, s->nb_sectors >> 48);
+}
+
 static void ide_identify(IDEState *s)
 {
     uint16_t *p;
     unsigned int oldsize;
     IDEDevice *dev = s->unit ? s->bus->slave : s->bus->master;
 
+    p = (uint16_t *)s->identify_data;
     if (s->identify_set) {
-	memcpy(s->io_buffer, s->identify_data, sizeof(s->identify_data));
-	return;
+        goto fill_buffer;
     }
+    memset(p, 0, sizeof(s->identify_data));
 
-    memset(s->io_buffer, 0, 512);
-    p = (uint16_t *)s->io_buffer;
     put_le16(p + 0, 0x0040);
     put_le16(p + 1, s->cylinders);
     put_le16(p + 3, s->heads);
@@ -116,8 +126,8 @@ static void ide_identify(IDEState *s)
     put_le16(p + 58, oldsize >> 16);
     if (s->mult_sectors)
         put_le16(p + 59, 0x100 | s->mult_sectors);
-    put_le16(p + 60, s->nb_sectors);
-    put_le16(p + 61, s->nb_sectors >> 16);
+    /* *(p + 60) := nb_sectors       -- see ide_identify_size */
+    /* *(p + 61) := nb_sectors >> 16 -- see ide_identify_size */
     put_le16(p + 62, 0x07); /* single word dma0-2 supported */
     put_le16(p + 63, 0x07); /* mdma0-2 supported */
     put_le16(p + 64, 0x03); /* pio3-4 supported */
@@ -162,10 +172,10 @@ static void ide_identify(IDEState *s)
     }
     put_le16(p + 88, 0x3f | (1 << 13)); /* udma5 set and supported */
     put_le16(p + 93, 1 | (1 << 14) | 0x2000);
-    put_le16(p + 100, s->nb_sectors);
-    put_le16(p + 101, s->nb_sectors >> 16);
-    put_le16(p + 102, s->nb_sectors >> 32);
-    put_le16(p + 103, s->nb_sectors >> 48);
+    /* *(p + 100) := nb_sectors       -- see ide_identify_size */
+    /* *(p + 101) := nb_sectors >> 16 -- see ide_identify_size */
+    /* *(p + 102) := nb_sectors >> 32 -- see ide_identify_size */
+    /* *(p + 103) := nb_sectors >> 48 -- see ide_identify_size */
 
     if (dev && dev->conf.physical_block_size)
         put_le16(p + 106, 0x6000 | get_physical_block_exp(&dev->conf));
@@ -180,21 +190,23 @@ static void ide_identify(IDEState *s)
         put_le16(p + 169, 1); /* TRIM support */
     }
 
-    memcpy(s->identify_data, p, sizeof(s->identify_data));
+    ide_identify_size(s);
     s->identify_set = 1;
+
+fill_buffer:
+    memcpy(s->io_buffer, p, sizeof(s->identify_data));
 }
 
 static void ide_atapi_identify(IDEState *s)
 {
     uint16_t *p;
 
+    p = (uint16_t *)s->identify_data;
     if (s->identify_set) {
-	memcpy(s->io_buffer, s->identify_data, sizeof(s->identify_data));
-	return;
+        goto fill_buffer;
     }
+    memset(p, 0, sizeof(s->identify_data));
 
-    memset(s->io_buffer, 0, 512);
-    p = (uint16_t *)s->io_buffer;
     /* Removable CDROM, 50us response, 12 byte packets */
     put_le16(p + 0, (2 << 14) | (5 << 8) | (1 << 7) | (2 << 5) | (0 << 0));
     padstr((char *)(p + 10), s->drive_serial_str, 20); /* serial number */
@@ -230,11 +242,36 @@ static void ide_atapi_identify(IDEState *s)
     }
 
     put_le16(p + 80, 0x1e); /* support up to ATA/ATAPI-4 */
+    if (s->wwn) {
+        put_le16(p + 84, (1 << 8)); /* supports WWN for words 108-111 */
+        put_le16(p + 87, (1 << 8)); /* WWN enabled */
+    }
+
 #ifdef USE_DMA_CDROM
     put_le16(p + 88, 0x3f | (1 << 13)); /* udma5 set and supported */
 #endif
-    memcpy(s->identify_data, p, sizeof(s->identify_data));
+
+    if (s->wwn) {
+        /* LE 16-bit words 111-108 contain 64-bit World Wide Name */
+        put_le16(p + 108, s->wwn >> 48);
+        put_le16(p + 109, s->wwn >> 32);
+        put_le16(p + 110, s->wwn >> 16);
+        put_le16(p + 111, s->wwn);
+    }
+
     s->identify_set = 1;
+
+fill_buffer:
+    memcpy(s->io_buffer, p, sizeof(s->identify_data));
+}
+
+static void ide_cfata_identify_size(IDEState *s)
+{
+    uint16_t *p = (uint16_t *)s->identify_data;
+    put_le16(p + 7, s->nb_sectors >> 16);  /* Sectors per card */
+    put_le16(p + 8, s->nb_sectors);        /* Sectors per card */
+    put_le16(p + 60, s->nb_sectors);       /* Total LBA sectors */
+    put_le16(p + 61, s->nb_sectors >> 16); /* Total LBA sectors */
 }
 
 static void ide_cfata_identify(IDEState *s)
@@ -242,10 +279,10 @@ static void ide_cfata_identify(IDEState *s)
     uint16_t *p;
     uint32_t cur_sec;
 
-    p = (uint16_t *) s->identify_data;
-    if (s->identify_set)
+    p = (uint16_t *)s->identify_data;
+    if (s->identify_set) {
         goto fill_buffer;
-
+    }
     memset(p, 0, sizeof(s->identify_data));
 
     cur_sec = s->cylinders * s->heads * s->sectors;
@@ -254,8 +291,8 @@ static void ide_cfata_identify(IDEState *s)
     put_le16(p + 1, s->cylinders);		/* Default cylinders */
     put_le16(p + 3, s->heads);			/* Default heads */
     put_le16(p + 6, s->sectors);		/* Default sectors per track */
-    put_le16(p + 7, s->nb_sectors >> 16);	/* Sectors per card */
-    put_le16(p + 8, s->nb_sectors);		/* Sectors per card */
+    /* *(p + 7) := nb_sectors >> 16 -- see ide_cfata_identify_size */
+    /* *(p + 8) := nb_sectors       -- see ide_cfata_identify_size */
     padstr((char *)(p + 10), s->drive_serial_str, 20); /* serial number */
     put_le16(p + 22, 0x0004);			/* ECC bytes */
     padstr((char *) (p + 23), s->version, 8);	/* Firmware Revision */
@@ -276,8 +313,8 @@ static void ide_cfata_identify(IDEState *s)
     put_le16(p + 58, cur_sec >> 16);		/* Current capacity */
     if (s->mult_sectors)			/* Multiple sector setting */
         put_le16(p + 59, 0x100 | s->mult_sectors);
-    put_le16(p + 60, s->nb_sectors);		/* Total LBA sectors */
-    put_le16(p + 61, s->nb_sectors >> 16);	/* Total LBA sectors */
+    /* *(p + 60) := nb_sectors       -- see ide_cfata_identify_size */
+    /* *(p + 61) := nb_sectors >> 16 -- see ide_cfata_identify_size */
     put_le16(p + 63, 0x0203);			/* Multiword DMA capability */
     put_le16(p + 64, 0x0001);			/* Flow Control PIO support */
     put_le16(p + 65, 0x0096);			/* Min. Multiword DMA cycle */
@@ -297,6 +334,7 @@ static void ide_cfata_identify(IDEState *s)
     put_le16(p + 160, 0x8100);			/* Power requirement */
     put_le16(p + 161, 0x8001);			/* CF command set */
 
+    ide_cfata_identify_size(s);
     s->identify_set = 1;
 
 fill_buffer:
@@ -420,6 +458,7 @@ BlockDriverAIOCB *ide_issue_trim(BlockDriverState *bs,
 
 static inline void ide_abort_command(IDEState *s)
 {
+    ide_transfer_stop(s);
     s->status = READY_STAT | ERR_STAT;
     s->error = ABRT_ERR;
 }
@@ -434,7 +473,16 @@ void ide_transfer_start(IDEState *s, uint8_t *buf, int size,
     if (!(s->status & ERR_STAT)) {
         s->status |= DRQ_STAT;
     }
-    s->bus->dma->ops->start_transfer(s->bus->dma);
+    if (s->bus->dma->ops->start_transfer) {
+        s->bus->dma->ops->start_transfer(s->bus->dma);
+    }
+}
+
+static void ide_cmd_done(IDEState *s)
+{
+    if (s->bus->dma->ops->cmd_done) {
+        s->bus->dma->ops->cmd_done(s->bus->dma);
+    }
 }
 
 void ide_transfer_stop(IDEState *s)
@@ -443,6 +491,7 @@ void ide_transfer_stop(IDEState *s)
     s->data_ptr = s->io_buffer;
     s->data_end = s->io_buffer;
     s->status &= ~DRQ_STAT;
+    ide_cmd_done(s);
 }
 
 int64_t ide_get_sector(IDEState *s)
@@ -521,8 +570,8 @@ static void ide_sector_read_cb(void *opaque, int ret)
 
     bdrv_acct_done(s->bs, &s->acct);
     if (ret != 0) {
-        if (ide_handle_rw_error(s, -ret, BM_STATUS_PIO_RETRY |
-                                BM_STATUS_RETRY_READ)) {
+        if (ide_handle_rw_error(s, -ret, IDE_RETRY_PIO |
+                                IDE_RETRY_READ)) {
             return;
         }
     }
@@ -580,45 +629,41 @@ void ide_sector_read(IDEState *s)
                                   ide_sector_read_cb, s);
 }
 
-static void dma_buf_commit(IDEState *s)
+static void dma_buf_commit(IDEState *s, uint32_t tx_bytes)
 {
+    if (s->bus->dma->ops->commit_buf) {
+        s->bus->dma->ops->commit_buf(s->bus->dma, tx_bytes);
+    }
     qemu_sglist_destroy(&s->sg);
 }
 
-static void ide_async_cmd_done(IDEState *s)
-{
-    if (s->bus->dma->ops->async_cmd_done) {
-        s->bus->dma->ops->async_cmd_done(s->bus->dma);
-    }
-}
-
-void ide_set_inactive(IDEState *s)
+void ide_set_inactive(IDEState *s, bool more)
 {
     s->bus->dma->aiocb = NULL;
-    s->bus->dma->ops->set_inactive(s->bus->dma);
-    ide_async_cmd_done(s);
+    if (s->bus->dma->ops->set_inactive) {
+        s->bus->dma->ops->set_inactive(s->bus->dma, more);
+    }
+    ide_cmd_done(s);
 }
 
 void ide_dma_error(IDEState *s)
 {
-    ide_transfer_stop(s);
-    s->error = ABRT_ERR;
-    s->status = READY_STAT | ERR_STAT;
-    ide_set_inactive(s);
+    dma_buf_commit(s, 0);
+    ide_abort_command(s);
+    ide_set_inactive(s, false);
     ide_set_irq(s->bus);
 }
 
 static int ide_handle_rw_error(IDEState *s, int error, int op)
 {
-    bool is_read = (op & BM_STATUS_RETRY_READ) != 0;
+    bool is_read = (op & IDE_RETRY_READ) != 0;
     BlockErrorAction action = bdrv_get_error_action(s->bs, is_read, error);
 
     if (action == BLOCK_ERROR_ACTION_STOP) {
         s->bus->dma->ops->set_unit(s->bus->dma, s->unit);
         s->bus->error_status = op;
     } else if (action == BLOCK_ERROR_ACTION_REPORT) {
-        if (op & BM_STATUS_DMA_RETRY) {
-            dma_buf_commit(s);
+        if (op & IDE_RETRY_DMA) {
             ide_dma_error(s);
         } else {
             ide_rw_error(s);
@@ -636,12 +681,12 @@ void ide_dma_cb(void *opaque, int ret)
     bool stay_active = false;
 
     if (ret < 0) {
-        int op = BM_STATUS_DMA_RETRY;
+        int op = IDE_RETRY_DMA;
 
         if (s->dma_cmd == IDE_DMA_READ)
-            op |= BM_STATUS_RETRY_READ;
+            op |= IDE_RETRY_READ;
         else if (s->dma_cmd == IDE_DMA_TRIM)
-            op |= BM_STATUS_RETRY_TRIM;
+            op |= IDE_RETRY_TRIM;
 
         if (ide_handle_rw_error(s, -ret, op)) {
             return;
@@ -659,7 +704,8 @@ void ide_dma_cb(void *opaque, int ret)
 
     sector_num = ide_get_sector(s);
     if (n > 0) {
-        dma_buf_commit(s);
+        assert(s->io_buffer_size == s->sg.size);
+        dma_buf_commit(s, s->io_buffer_size);
         sector_num += n;
         ide_set_sector(s, sector_num);
         s->nsector -= n;
@@ -690,7 +736,6 @@ void ide_dma_cb(void *opaque, int ret)
 
     if ((s->dma_cmd == IDE_DMA_READ || s->dma_cmd == IDE_DMA_WRITE) &&
         !ide_sect_range_ok(s, sector_num, n)) {
-        dma_buf_commit(s);
         ide_dma_error(s);
         return;
     }
@@ -716,10 +761,7 @@ eot:
     if (s->dma_cmd == IDE_DMA_READ || s->dma_cmd == IDE_DMA_WRITE) {
         bdrv_acct_done(s->bs, &s->acct);
     }
-    ide_set_inactive(s);
-    if (stay_active) {
-        s->bus->dma->ops->add_status(s->bus->dma, BM_STATUS_DMAING);
-    }
+    ide_set_inactive(s, stay_active);
 }
 
 static void ide_sector_start_dma(IDEState *s, enum ide_dma_cmd dma_cmd)
@@ -742,7 +784,14 @@ static void ide_sector_start_dma(IDEState *s, enum ide_dma_cmd dma_cmd)
         break;
     }
 
-    s->bus->dma->ops->start_dma(s->bus->dma, s, ide_dma_cb);
+    ide_start_dma(s, ide_dma_cb);
+}
+
+void ide_start_dma(IDEState *s, BlockDriverCompletionFunc *cb)
+{
+    if (s->bus->dma->ops->start_dma) {
+        s->bus->dma->ops->start_dma(s->bus->dma, s, cb);
+    }
 }
 
 static void ide_sector_write_timer_cb(void *opaque)
@@ -762,7 +811,7 @@ static void ide_sector_write_cb(void *opaque, int ret)
     s->status &= ~BUSY_STAT;
 
     if (ret != 0) {
-        if (ide_handle_rw_error(s, -ret, BM_STATUS_PIO_RETRY)) {
+        if (ide_handle_rw_error(s, -ret, IDE_RETRY_PIO)) {
             return;
         }
     }
@@ -832,16 +881,20 @@ static void ide_flush_cb(void *opaque, int ret)
 {
     IDEState *s = opaque;
 
+    s->pio_aiocb = NULL;
+
     if (ret < 0) {
         /* XXX: What sector number to set here? */
-        if (ide_handle_rw_error(s, -ret, BM_STATUS_RETRY_FLUSH)) {
+        if (ide_handle_rw_error(s, -ret, IDE_RETRY_FLUSH)) {
             return;
         }
     }
 
-    bdrv_acct_done(s->bs, &s->acct);
+    if (s->bs) {
+        bdrv_acct_done(s->bs, &s->acct);
+    }
     s->status = READY_STAT | SEEK_STAT;
-    ide_async_cmd_done(s);
+    ide_cmd_done(s);
     ide_set_irq(s->bus);
 }
 
@@ -854,7 +907,7 @@ void ide_flush_cache(IDEState *s)
 
     s->status |= BUSY_STAT;
     bdrv_acct_start(s->bs, &s->acct, 0, BDRV_ACCT_FLUSH);
-    bdrv_aio_flush(s->bs, ide_flush_cb, s);
+    s->pio_aiocb = bdrv_aio_flush(s->bs, ide_flush_cb, s);
 }
 
 static void ide_cfata_metadata_inquiry(IDEState *s)
@@ -1765,6 +1818,7 @@ void ide_exec_cmd(IDEBus *bus, uint32_t val)
             s->status |= SEEK_STAT;
         }
 
+        ide_cmd_done(s);
         ide_set_irq(s->bus);
     }
 }
@@ -1930,11 +1984,17 @@ void ide_data_writew(void *opaque, uint32_t addr, uint32_t val)
     }
 
     p = s->data_ptr;
+    if (p + 2 > s->data_end) {
+        return;
+    }
+
     *(uint16_t *)p = le16_to_cpu(val);
     p += 2;
     s->data_ptr = p;
-    if (p >= s->data_end)
+    if (p >= s->data_end) {
+        s->status &= ~DRQ_STAT;
         s->end_transfer_func(s);
+    }
 }
 
 uint32_t ide_data_readw(void *opaque, uint32_t addr)
@@ -1951,11 +2011,17 @@ uint32_t ide_data_readw(void *opaque, uint32_t addr)
     }
 
     p = s->data_ptr;
+    if (p + 2 > s->data_end) {
+        return 0;
+    }
+
     ret = cpu_to_le16(*(uint16_t *)p);
     p += 2;
     s->data_ptr = p;
-    if (p >= s->data_end)
+    if (p >= s->data_end) {
+        s->status &= ~DRQ_STAT;
         s->end_transfer_func(s);
+    }
     return ret;
 }
 
@@ -1972,11 +2038,17 @@ void ide_data_writel(void *opaque, uint32_t addr, uint32_t val)
     }
 
     p = s->data_ptr;
+    if (p + 4 > s->data_end) {
+        return;
+    }
+
     *(uint32_t *)p = le32_to_cpu(val);
     p += 4;
     s->data_ptr = p;
-    if (p >= s->data_end)
+    if (p >= s->data_end) {
+        s->status &= ~DRQ_STAT;
         s->end_transfer_func(s);
+    }
 }
 
 uint32_t ide_data_readl(void *opaque, uint32_t addr)
@@ -1993,11 +2065,17 @@ uint32_t ide_data_readl(void *opaque, uint32_t addr)
     }
 
     p = s->data_ptr;
+    if (p + 4 > s->data_end) {
+        return 0;
+    }
+
     ret = cpu_to_le32(*(uint32_t *)p);
     p += 4;
     s->data_ptr = p;
-    if (p >= s->data_end)
+    if (p >= s->data_end) {
+        s->status &= ~DRQ_STAT;
         s->end_transfer_func(s);
+    }
     return ret;
 }
 
@@ -2087,7 +2165,9 @@ void ide_bus_reset(IDEBus *bus)
     }
 
     /* reset dma provider too */
-    bus->dma->ops->reset(bus->dma);
+    if (bus->dma->ops->reset) {
+        bus->dma->ops->reset(bus->dma);
+    }
 }
 
 static bool ide_cd_is_tray_open(void *opaque)
@@ -2100,11 +2180,37 @@ static bool ide_cd_is_medium_locked(void *opaque)
     return ((IDEState *)opaque)->tray_locked;
 }
 
+static void ide_resize_cb(void *opaque)
+{
+    IDEState *s = opaque;
+    uint64_t nb_sectors;
+
+    if (!s->identify_set) {
+        return;
+    }
+
+    bdrv_get_geometry(s->bs, &nb_sectors);
+    s->nb_sectors = nb_sectors;
+
+    /* Update the identify data buffer. */
+    if (s->drive_kind == IDE_CFATA) {
+        ide_cfata_identify_size(s);
+    } else {
+        /* IDE_CD uses a different set of callbacks entirely. */
+        assert(s->drive_kind != IDE_CD);
+        ide_identify_size(s);
+    }
+}
+
 static const BlockDevOps ide_cd_block_ops = {
     .change_media_cb = ide_cd_change_cb,
     .eject_request_cb = ide_cd_eject_request_cb,
     .is_tray_open = ide_cd_is_tray_open,
     .is_medium_locked = ide_cd_is_medium_locked,
+};
+
+static const BlockDevOps ide_hd_block_ops = {
+    .resize_cb = ide_resize_cb,
 };
 
 int ide_init_drive(IDEState *s, BlockDriverState *bs, IDEDriveKind kind,
@@ -2143,6 +2249,7 @@ int ide_init_drive(IDEState *s, BlockDriverState *bs, IDEDriveKind kind,
             error_report("Can't use a read-only drive");
             return -1;
         }
+        bdrv_set_dev_ops(bs, &ide_hd_block_ops, s);
     }
     if (serial) {
         pstrcpy(s->drive_serial_str, sizeof(s->drive_serial_str), serial);
@@ -2197,16 +2304,6 @@ static void ide_init1(IDEBus *bus, int unit)
                                            ide_sector_write_timer_cb, s);
 }
 
-static void ide_nop_start(IDEDMA *dma, IDEState *s,
-                          BlockDriverCompletionFunc *cb)
-{
-}
-
-static int ide_nop(IDEDMA *dma)
-{
-    return 0;
-}
-
 static int ide_nop_int(IDEDMA *dma, int x)
 {
     return 0;
@@ -2217,15 +2314,10 @@ static void ide_nop_restart(void *opaque, int x, RunState y)
 }
 
 static const IDEDMAOps ide_dma_nop_ops = {
-    .start_dma      = ide_nop_start,
-    .start_transfer = ide_nop,
     .prepare_buf    = ide_nop_int,
     .rw_buf         = ide_nop_int,
     .set_unit       = ide_nop_int,
-    .add_status     = ide_nop_int,
-    .set_inactive   = ide_nop,
     .restart_cb     = ide_nop_restart,
-    .reset          = ide_nop,
 };
 
 static IDEDMA ide_dma_nop = {
@@ -2342,7 +2434,7 @@ static bool ide_drive_pio_state_needed(void *opaque)
     IDEState *s = opaque;
 
     return ((s->status & DRQ_STAT) != 0)
-        || (s->bus->error_status & BM_STATUS_PIO_RETRY);
+        || (s->bus->error_status & IDE_RETRY_PIO);
 }
 
 static bool ide_tray_state_needed(void *opaque)
@@ -2481,16 +2573,28 @@ const VMStateDescription vmstate_ide_bus = {
     }
 };
 
-void ide_drive_get(DriveInfo **hd, int max_bus)
+void ide_drive_get(DriveInfo **hd, int n)
 {
     int i;
+    int highest_bus = drive_get_max_bus(IF_IDE) + 1;
+    int max_devs = drive_get_max_devs(IF_IDE);
+    int n_buses = max_devs ? (n / max_devs) : n;
 
-    if (drive_get_max_bus(IF_IDE) >= max_bus) {
-        fprintf(stderr, "qemu: too many IDE bus: %d\n", max_bus);
+    /*
+     * Note: The number of actual buses available is not known.
+     * We compute this based on the size of the DriveInfo* array, n.
+     * If it is less than max_devs * <num_real_buses>,
+     * We will stop looking for drives prematurely instead of overfilling
+     * the array.
+     */
+
+    if (highest_bus > n_buses) {
+        error_report("Too many IDE buses defined (%d > %d)",
+                     highest_bus, n_buses);
         exit(1);
     }
 
-    for(i = 0; i < max_bus * MAX_IDE_DEVS; i++) {
-        hd[i] = drive_get(IF_IDE, i / MAX_IDE_DEVS, i % MAX_IDE_DEVS);
+    for (i = 0; i < n; i++) {
+        hd[i] = drive_get_by_index(IF_IDE, i);
     }
 }
