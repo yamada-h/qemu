@@ -537,7 +537,7 @@ static void sd_aio_cancel(BlockDriverAIOCB *blockacb)
 
 static const AIOCBInfo sd_aiocb_info = {
     .aiocb_size     = sizeof(SheepdogAIOCB),
-    .cancel_async   = sd_aio_cancel,
+    .cancel   = sd_aio_cancel,
 };
 
 static SheepdogAIOCB *sd_aio_setup(BlockDriverState *bs, QEMUIOVector *qiov,
