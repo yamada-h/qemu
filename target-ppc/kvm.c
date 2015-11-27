@@ -1882,6 +1882,23 @@ int kvmppc_get_hypercall(CPUPPCState *env, uint8_t *buf, int buf_len)
     return 0;
 }
 
+static inline int kvmppc_enable_hcall(KVMState *s, target_ulong hcall)
+{
+    return kvm_vm_enable_cap(s, KVM_CAP_PPC_ENABLE_HCALL, 0, hcall, 1);
+}
+
+void kvmppc_enable_logical_ci_hcalls(void)
+{
+    /*
+     * FIXME: it would be nice if we could detect the cases where
+     * we're using a device which requires the in kernel
+     * implementation of these hcalls, but the kernel lacks them and
+     * produce a warning.
+     */
+    kvmppc_enable_hcall(kvm_state, H_LOGICAL_CI_LOAD);
+    kvmppc_enable_hcall(kvm_state, H_LOGICAL_CI_STORE);
+}
+
 void kvmppc_set_papr(PowerPCCPU *cpu)
 {
     CPUState *cs = CPU(cpu);
@@ -1995,7 +2012,7 @@ bool kvmppc_spapr_use_multitce(void)
 }
 
 void *kvmppc_create_spapr_tce(uint32_t liobn, uint32_t window_size, int *pfd,
-                              bool vfio_accel)
+                              bool need_vfio)
 {
     struct kvm_create_spapr_tce args = {
         .liobn = liobn,
@@ -2009,7 +2026,7 @@ void *kvmppc_create_spapr_tce(uint32_t liobn, uint32_t window_size, int *pfd,
      * destroying the table, which the upper layers -will- do
      */
     *pfd = -1;
-    if (!cap_spapr_tce || (vfio_accel && !cap_spapr_vfio)) {
+    if (!cap_spapr_tce || (need_vfio && !cap_spapr_vfio)) {
         return NULL;
     }
 
@@ -2117,6 +2134,7 @@ static void kvmppc_host_cpu_initfn(Object *obj)
 
 static void kvmppc_host_cpu_class_init(ObjectClass *oc, void *data)
 {
+    DeviceClass *dc = DEVICE_CLASS(oc);
     PowerPCCPUClass *pcc = POWERPC_CPU_CLASS(oc);
     uint32_t vmx = kvmppc_get_vmx();
     uint32_t dfp = kvmppc_get_dfp();
@@ -2143,6 +2161,9 @@ static void kvmppc_host_cpu_class_init(ObjectClass *oc, void *data)
     if (icache_size != -1) {
         pcc->l1_icache_size = icache_size;
     }
+
+    /* Reason: kvmppc_host_cpu_initfn() dies when !kvm_enabled() */
+    dc->cannot_destroy_with_object_finalize_yet = true;
 }
 
 bool kvmppc_has_cap_epr(void)
@@ -2407,4 +2428,9 @@ int kvm_arch_fixup_msi_route(struct kvm_irq_routing_entry *route,
                              uint64_t address, uint32_t data)
 {
     return 0;
+}
+
+int kvm_arch_msi_data_to_gsi(uint32_t data)
+{
+    return data & 0xffff;
 }
