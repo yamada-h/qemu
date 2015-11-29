@@ -1537,7 +1537,8 @@ static void sd_reopen_commit(BDRVReopenState *state)
     BDRVSheepdogState *s = state->bs->opaque;
 
     if (s->fd) {
-        aio_set_fd_handler(s->aio_context, s->fd, NULL, NULL, NULL);
+        aio_set_fd_handler(s->aio_context, s->fd, AIO_CLIENT_PROTOCOL,
+                           NULL, NULL, NULL);
         closesocket(s->fd);
     }
 
@@ -1560,7 +1561,8 @@ static void sd_reopen_abort(BDRVReopenState *state)
     }
 
     if (re_s->fd) {
-        aio_set_fd_handler(s->aio_context, re_s->fd, NULL, NULL, NULL);
+        aio_set_fd_handler(s->aio_context, re_s->fd, AIO_CLIENT_PROTOCOL,
+                           NULL, NULL, NULL);
         closesocket(re_s->fd);
     }
 
